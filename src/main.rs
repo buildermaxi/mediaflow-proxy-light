@@ -1,5 +1,5 @@
 use actix_cors::Cors;
-use actix_web::middleware::Logger;
+use actix_web::middleware::{from_fn, Logger};
 use actix_web::{web, App, HttpServer};
 use std::sync::Arc;
 use tracing_subscriber::{fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt};
@@ -168,12 +168,14 @@ async fn main() -> std::io::Result<()> {
 
         let mut app = App::new()
             .wrap(cors)
-            .wrap(Logger::new("%a - \"%r\" %s"))
+            .wrap(Logger::new("%a - \"%r\" %s").exclude("/dashboard/stats"))
             // Compress::default() is intentionally omitted: the proxy streams
             // binary media (video/audio) that is already compressed.  Applying
             // gzip/brotli to such data burns CPU with zero gain and — worse —
             // actix's Compress wrapper buffers each streaming chunk before
             // encoding, which badly hurts streaming throughput.
+            // Traffic meter sits inside auth so only authenticated traffic counts.
+            .wrap(from_fn(metrics::traffic::traffic_meter))
             .wrap(auth_middleware.clone())
             .app_data(web::Data::new(stream_manager.clone()))
             .app_data(web::Data::new(config.clone()))
@@ -207,7 +209,16 @@ async fn main() -> std::io::Result<()> {
             // Health check
             .service(web::scope("/health").route("", web::get().to(|| async { "OK" })))
             // Usage metrics (unauthenticated — data is not sensitive)
-            .route("/metrics", web::get().to(metrics::metrics_handler));
+            .route("/metrics", web::get().to(metrics::metrics_handler))
+            // Live usage dashboard (page: static/dashboard.html)
+            .route(
+                "/dashboard",
+                web::get().to(metrics::dashboard::dashboard_redirect_handler),
+            )
+            .route(
+                "/dashboard/stats",
+                web::get().to(metrics::dashboard::dashboard_stats_handler),
+            );
 
         // HLS routes (Phase 1)
         // Both semantic paths (/manifest) and Python-style .m3u8 paths are registered.

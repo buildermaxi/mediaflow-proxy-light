@@ -80,7 +80,6 @@ pub async fn hls_segment_handler(
             .get_cached_segment(&proxy_data.destination, &pass_headers)
             .await
         {
-            metrics.add_bytes_out(bytes.len() as u64);
             let content_len = bytes.len();
             let mut resp = HttpResponse::Ok();
             resp.content_type(hls_segment_content_type(&proxy_data.destination));
@@ -142,17 +141,9 @@ pub async fn hls_segment_handler(
 
     match stream_opt {
         Some(stream) => {
-            use futures::StreamExt;
-            let metrics_clone = std::sync::Arc::clone(&metrics);
-            let stream_with_progress = stream_manager.stream_with_progress(stream).map(
-                move |chunk: Result<actix_web::web::Bytes, crate::error::AppError>| {
-                    if let Ok(ref b) = chunk {
-                        metrics_clone.add_bytes_out(b.len() as u64);
-                    }
-                    chunk
-                },
+            let response_stream = crate::proxy::stream::ResponseStream::new(
+                stream_manager.stream_with_progress(stream),
             );
-            let response_stream = crate::proxy::stream::ResponseStream::new(stream_with_progress);
             if content_length > 0 {
                 Ok(resp
                     .no_chunking(content_length)

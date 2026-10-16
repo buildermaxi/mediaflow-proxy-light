@@ -309,7 +309,7 @@ pub async fn live_stream_handler(
             .finish());
     }
 
-    proxy_stream_response(&upstream_url, &req, &stream_manager, &metrics).await
+    proxy_stream_response(&upstream_url, &req, &stream_manager).await
 }
 
 // ---------------------------------------------------------------------------
@@ -341,7 +341,7 @@ pub async fn movie_stream_handler(
 
     tracing::info!("XC movie: {stream_path}");
 
-    proxy_stream_response(&upstream_url, &req, &stream_manager, &metrics).await
+    proxy_stream_response(&upstream_url, &req, &stream_manager).await
 }
 
 // ---------------------------------------------------------------------------
@@ -373,7 +373,7 @@ pub async fn series_stream_handler(
 
     tracing::info!("XC series: {stream_path}");
 
-    proxy_stream_response(&upstream_url, &req, &stream_manager, &metrics).await
+    proxy_stream_response(&upstream_url, &req, &stream_manager).await
 }
 
 // ---------------------------------------------------------------------------
@@ -405,7 +405,7 @@ pub async fn timeshift_handler(
 
     tracing::info!("XC timeshift: {stream_path}");
 
-    proxy_stream_response(&upstream_url, &req, &stream_manager, &metrics).await
+    proxy_stream_response(&upstream_url, &req, &stream_manager).await
 }
 
 // ---------------------------------------------------------------------------
@@ -434,7 +434,7 @@ pub async fn short_stream_handler(
 
     tracing::info!("XC short stream: {stream_path}");
 
-    proxy_stream_response(&upstream_url, &req, &stream_manager, &metrics).await
+    proxy_stream_response(&upstream_url, &req, &stream_manager).await
 }
 
 // ---------------------------------------------------------------------------
@@ -445,7 +445,6 @@ async fn proxy_stream_response(
     upstream_url: &str,
     req: &HttpRequest,
     stream_manager: &StreamManager,
-    metrics: &AppMetrics,
 ) -> AppResult<HttpResponse> {
     let headers = pass_through_headers(req);
     let response = stream_manager
@@ -460,8 +459,6 @@ async fn proxy_stream_response(
         .bytes()
         .await
         .map_err(|e| AppError::Proxy(format!("Failed to read upstream body: {e}")))?;
-
-    metrics.add_bytes_out(body_bytes.len() as u64);
 
     let mut resp = HttpResponse::build(
         actix_web::http::StatusCode::from_u16(status.as_u16())

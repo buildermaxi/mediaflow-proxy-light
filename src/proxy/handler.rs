@@ -4,7 +4,7 @@ use actix_web::{
     web::{self, Bytes},
     HttpRequest, HttpResponse,
 };
-use futures::{stream, StreamExt};
+use futures::stream;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::boxed::Box;
 use std::collections::HashMap;
@@ -27,26 +27,13 @@ use crate::{
     utils::base64_url::{decode_base64_url, encode_url_to_base64, is_base64_url},
 };
 
-/// RAII guard: increments active_connections on creation, decrements on drop.
-struct ConnectionGuard(Arc<AppMetrics>);
-impl Drop for ConnectionGuard {
-    fn drop(&mut self) {
-        self.0.connection_close();
-    }
-}
-
 async fn handle_proxy_request(
     req: HttpRequest,
     stream_manager: web::Data<StreamManager>,
     proxy_data: web::ReqData<ProxyData>,
-    metrics: web::Data<Arc<AppMetrics>>,
     is_head: bool,
     destination_override: Option<String>,
 ) -> AppResult<HttpResponse> {
-    // Track active connection for the lifetime of this request
-    metrics.connection_open();
-    let _conn_guard = ConnectionGuard(Arc::clone(&metrics));
-
     let destination = destination_override
         .filter(|d| !d.is_empty())
         .unwrap_or_else(|| proxy_data.destination.clone());
@@ -149,17 +136,7 @@ async fn handle_proxy_request(
             .no_chunking(content_length)
             .body(SizedStream::new(content_length, empty_stream)))
     } else if let Some(stream) = stream_opt {
-        // Wrap stream to count bytes served for metrics
-        let metrics_clone = Arc::clone(&metrics);
-        let counted_stream = stream_manager
-            .stream_with_progress(stream)
-            .map(move |chunk| {
-                if let Ok(ref bytes) = chunk {
-                    metrics_clone.add_bytes_out(bytes.len() as u64);
-                }
-                chunk
-            });
-        let response_stream = ResponseStream::new(counted_stream);
+        let response_stream = ResponseStream::new(stream_manager.stream_with_progress(stream));
         if content_length > 0 {
             Ok(response
                 .no_chunking(content_length)
@@ -209,7 +186,7 @@ pub async fn proxy_stream_get(
         .proxy_stream_requests
         .fetch_add(1, Ordering::Relaxed);
     let destination = resolve_stream_destination(&req, &proxy_data);
-    handle_proxy_request(req, stream_manager, proxy_data, metrics, false, destination).await
+    handle_proxy_request(req, stream_manager, proxy_data, false, destination).await
 }
 
 pub async fn proxy_stream_head(
@@ -223,7 +200,7 @@ pub async fn proxy_stream_head(
         .proxy_stream_requests
         .fetch_add(1, Ordering::Relaxed);
     let destination = resolve_stream_destination(&req, &proxy_data);
-    handle_proxy_request(req, stream_manager, proxy_data, metrics, true, destination).await
+    handle_proxy_request(req, stream_manager, proxy_data, true, destination).await
 }
 
 // Headers that must not be forwarded upstream (they'd leak the caller's IP).

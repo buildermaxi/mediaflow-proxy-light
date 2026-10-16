@@ -128,6 +128,8 @@ See [Forward proxy](forward.md) for full details.
 | `GET` | `/base64/check` | Check if a string is base64-encoded |
 | `GET` | `/health` | Health check (`{"status":"ok"}`) |
 | `GET` | `/metrics` | Prometheus-style request metrics |
+| `GET` | `/dashboard` | Live dashboard UI: memory, active users, bandwidth (API password required) |
+| `GET` | `/dashboard/stats` | JSON feed for the dashboard (`Authorization: Bearer <api_password>`) |
 | `GET` | `/playlist/builder` | M3U playlist builder UI |
 | `GET` | `/speedtest` | Speed test UI |
 

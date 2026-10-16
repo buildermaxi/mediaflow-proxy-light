@@ -24,6 +24,10 @@ const OPEN_ENDPOINTS: &[&str] = &[
     "/speedtest",
     "/url-generator",
     "/playlist/builder",
+    // Dashboard: redirect + stats feed, which checks a Bearer api_password itself
+    // (header, so the secret stays out of access logs on every poll).
+    "/dashboard",
+    "/dashboard/stats",
 ];
 
 /// Static web UI assets (html/js/css/images) are public — they contain no secrets.
@@ -61,7 +65,7 @@ fn is_static_asset(path: &str) -> bool {
 /// mirroring the Python `mediaflow-proxy`, which registers the XC router WITHOUT
 /// the global auth dependency. Auth is NOT bypassed: the handler still rejects a
 /// wrong/missing embedded password with 403.
-fn is_xtream_route(path: &str) -> bool {
+pub(crate) fn is_xtream_route(path: &str) -> bool {
     const XC_EXACT: &[&str] = &[
         "/player_api.php",
         "/xmltv.php",

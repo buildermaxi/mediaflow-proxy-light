@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard · MediaFlow Proxy Light</title>
+    <link rel="icon" href="/logo.png">
+    <script>
+        // Apply the shared theme before first paint (same key as the other pages).
+        document.documentElement.classList.toggle('dark', localStorage.getItem('theme') === 'dark');
+    </script>
+    <style>
+        :root {
+            color-scheme: light;
+            --bg: #f4f4f2;
+            --surface: #fcfcfb;
+            --border: #e4e3df;
+            --text: #0b0b0b;
+            --text-2: #52514e;
+            --muted: #807f7a;
+            --accent: #4f46e5;
+            --spark: #a5a1f0;
+            --danger: #c62828;
+        }
+        html.dark {
+            color-scheme: dark;
+            --bg: #111110;
+            --surface: #1a1a19;
+            --border: #2e2e2c;
+            --text: #f0efec;
+            --text-2: #c3c2b7;
+            --muted: #8f8e86;
+            --accent: #8b93f8;
+            --spark: #4d4f9a;
+            --danger: #ef6b6b;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            min-height: 100vh;
+            background: var(--bg);
+            color: var(--text);
+            font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+        }
+        main { max-width: 880px; margin: 0 auto; padding: 40px 20px; }
+        header { display: flex; align-items: center; gap: 12px; margin-bottom: 28px; }
+        h1 { font-size: 22px; font-weight: 600; margin: 0; }
+        a, button.link { color: var(--text-2); font: inherit; font-size: 13px; }
+        .spacer { flex: 1; }
+        .status { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
+        .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+        .dot.live { background: #1baf7a; }
+        button {
+            font: inherit; cursor: pointer; border-radius: 8px;
+            border: 1px solid var(--border); background: var(--surface); color: var(--text);
+            padding: 6px 12px;
+        }
+        button.link { border: 0; background: none; padding: 0; text-decoration: underline; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+        .card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 20px; }
+        .label { font-size: 13px; color: var(--text-2); }
+        .value { font-size: 36px; font-weight: 600; margin: 4px 0 2px; letter-spacing: -0.01em; }
+        .sub { font-size: 13px; color: var(--muted); min-height: 1.45em; }
+        svg.spark { display: block; width: 100%; height: 44px; margin-top: 14px; overflow: visible; }
+        svg.spark path { fill: none; stroke: var(--spark); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+        svg.spark circle { fill: var(--accent); stroke: var(--surface); stroke-width: 2; }
+        svg.spark line { stroke: var(--muted); stroke-width: 1; }
+        footer { margin-top: 20px; font-size: 13px; color: var(--muted); }
+        #gate { max-width: 380px; margin: 60px auto; }
+        #gate form { display: flex; gap: 8px; margin-top: 12px; }
+        #gate input {
+            flex: 1; font: inherit; padding: 6px 10px; border-radius: 8px;
+            border: 1px solid var(--border); background: var(--bg); color: var(--text);
+        }
+        #gate .error { color: var(--danger); font-size: 13px; margin-top: 10px; min-height: 1.45em; }
+        [hidden] { display: none !important; }
+    </style>
+</head>
+<body>
+<main>
+    <header>
+        <h1>Dashboard</h1>
+        <div class="status"><span id="dot" class="dot"></span><span id="status">connecting…</span></div>
+        <div class="spacer"></div>
+        <a href="/">Home</a>
+        <button id="signOut" class="link" hidden>Sign out</button>
+        <button id="themeToggle" aria-label="Toggle theme">◐</button>
+    </header>
+
+    <section id="gate" class="card" hidden>
+        <div class="label">Enter the API password to view live stats.</div>
+        <form id="gateForm">
+            <input id="password" type="password" autocomplete="current-password" placeholder="API password" required>
+            <button type="submit">Unlock</button>
+        </form>
+        <div id="gateError" class="error"></div>
+    </section>
+
+    <section id="stats" hidden>
+        <div class="grid">
+            <div class="card" data-metric="memory">
+                <div class="label">Memory in use</div>
+                <div class="value">—</div>
+                <div class="sub">resident set size</div>
+                <svg class="spark" role="img" aria-label="Memory, last 2 minutes"></svg>
+            </div>
+            <div class="card" data-metric="users">
+                <div class="label">Active users</div>
+                <div class="value">—</div>
+                <div class="sub"></div>
+                <svg class="spark" role="img" aria-label="Active users, last 2 minutes"></svg>
+            </div>
+            <div class="card" data-metric="bandwidth">
+                <div class="label">Bandwidth out</div>
+                <div class="value">—</div>
+                <div class="sub"></div>
+                <svg class="spark" role="img" aria-label="Bandwidth, last 2 minutes"></svg>
+            </div>
+        </div>
+        <footer id="footer">Estimates · refreshed every 2 s</footer>
+    </section>
+</main>
+
+<script>
+(() => {
+    const POLL_MS = 2000;
+    const RATE_WINDOW_MS = 10000;   // bandwidth = average over the last ~10 s
+    const HISTORY = 60;             // sparkline points (~2 min)
+    const PASSWORD_KEY = 'mediaflow_api_password';  // shared with the other tools
+
+    const $ = (id) => document.getElementById(id);
+    const tiles = Object.fromEntries([...document.querySelectorAll('[data-metric]')].map((el) => [
+        el.dataset.metric,
+        { value: el.querySelector('.value'), sub: el.querySelector('.sub'), svg: el.querySelector('svg'), history: [], subText: '' },
+    ]));
+    let samples = [];   // { t, bytes } within RATE_WINDOW_MS, for the bandwidth rate
+    let timer = null;
+
+    // ── Formatting ──────────────────────────────────────────────────────────
+    const fmtBytes = (b) => {
+        const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+        let i = 0;
+        while (b >= 1024 && i < units.length - 1) { b /= 1024; i++; }
+        return `${b.toFixed(i === 0 ? 0 : b < 10 ? 1 : 0)} ${units[i]}`;
+    };
+    const fmtBits = (bytesPerSec) => {
+        let v = bytesPerSec * 8;
+        const units = ['bit/s', 'kbit/s', 'Mbit/s', 'Gbit/s'];
+        let i = 0;
+        while (v >= 1000 && i < units.length - 1) { v /= 1000; i++; }
+        return `${v.toFixed(i === 0 || v >= 100 ? 0 : 1)} ${units[i]}`;
+    };
+    const fmtCount = (n) => String(Math.round(n));
+    const fmtUptime = (s) => {
+        const d = Math.floor(s / 86400), h = Math.floor(s / 3600) % 24, m = Math.floor(s / 60) % 60;
+        return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`;
+    };
+
+    // ── Sparkline (single series, zero baseline, newest point on the right) ─
+    function drawSpark(tile, fmt) {
+        const { svg, history } = tile;
+        const w = svg.clientWidth || 240, h = 44, pad = 4;
+        const max = Math.max(...history.map((p) => p ?? 0), 1e-9);
+        const step = (w - 2 * pad) / (HISTORY - 1);
+        const x = (i) => w - pad - (history.length - 1 - i) * step;
+        const y = (v) => h - pad - (v / max) * (h - 2 * pad);
+        const pts = history.map((v, i) => (v == null ? null : [x(i), y(v)]));
+        const d = pts.reduce((acc, p, i) => !p ? acc : acc + `${acc && pts[i - 1] ? 'L' : 'M'}${p[0].toFixed(1)},${p[1].toFixed(1)}`, '');
+        const last = pts[pts.length - 1];
+        svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+        svg.innerHTML = `<path d="${d}"/><line hidden y1="0" y2="${h}"/>` +
+            (last ? `<circle cx="${last[0]}" cy="${last[1]}" r="4"/>` : '');
+        svg.onmousemove = (e) => {
+            const rect = svg.getBoundingClientRect();
+            const i = Math.round(history.length - 1 - (w - pad - (e.clientX - rect.left) * (w / rect.width)) / step);
+            const v = history[i];
+            if (v == null) return;
+            const line = svg.querySelector('line');
+            line.removeAttribute('hidden');
+            line.setAttribute('x1', x(i));
+            line.setAttribute('x2', x(i));
+            const ago = Math.round((history.length - 1 - i) * POLL_MS / 1000);
+            tile.sub.textContent = `${fmt(v)} · ${ago ? `${ago}s ago` : 'now'}`;
+        };
+        svg.onmouseleave = () => {
+            svg.querySelector('line').setAttribute('hidden', '');
+            tile.sub.textContent = tile.subText;
+        };
+    }
+
+    function update(tile, value, fmt, subText) {
+        tile.history.push(value);
+        if (tile.history.length > HISTORY) tile.history.shift();
+        tile.value.textContent = value == null ? '—' : fmt(value);
+        tile.subText = subText;
+        if (!tile.svg.matches(':hover')) tile.sub.textContent = subText;
+        drawSpark(tile, fmt);
+    }
+
+    // ── Rendering ───────────────────────────────────────────────────────────
+    function render(s) {
+        const now = performance.now();
+        if (samples.length && s.bytes_out < samples[samples.length - 1].bytes) samples = [];  // server restarted
+        samples.push({ t: now, bytes: s.bytes_out });
+        while (samples.length > 1 && now - samples[0].t > RATE_WINDOW_MS) samples.shift();
+        const first = samples[0], last = samples[samples.length - 1];
+        const rate = last.t > first.t ? (last.bytes - first.bytes) / ((last.t - first.t) / 1000) : null;
+
+        update(tiles.memory, s.memory_rss_bytes, fmtBytes,
+            s.memory_rss_bytes == null ? 'not available on this platform' : 'resident set size');
+        update(tiles.users, s.active_clients, fmtCount,
+            `${s.active_streams} open stream${s.active_streams === 1 ? '' : 's'} · unique IPs, last 60 s`);
+        update(tiles.bandwidth, rate, fmtBits, `${fmtBytes(s.bytes_out)} served since start`);
+        $('footer').textContent = `Up ${fmtUptime(s.uptime_secs)} · estimates, refreshed every ${POLL_MS / 1000} s`;
+    }
+
+    function setStatus(text, live) {
+        $('status').textContent = text;
+        $('dot').classList.toggle('live', live);
+    }
+
+    function showGate(message) {
+        clearTimeout(timer);
+        $('stats').hidden = true;
+        $('signOut').hidden = true;
+        $('gate').hidden = false;
+        $('gateError').textContent = message || '';
+        setStatus('locked', false);
+        $('password').focus();
+    }
+
+    // ── Polling ─────────────────────────────────────────────────────────────
+    async function poll() {
+        clearTimeout(timer);
+        const password = localStorage.getItem(PASSWORD_KEY);
+        if (!password) return showGate();
+        try {
+            const res = await fetch('/dashboard/stats', {
+                headers: { Authorization: `Bearer ${password}` },
+                cache: 'no-store',
+            });
+            if (res.status === 401) return showGate('Wrong API password.');
+            if (!res.ok) {
+                const body = await res.json().catch(() => ({}));
+                return showGate(body.error || `Server error (${res.status}).`);
+            }
+            $('gate').hidden = true;
+            $('stats').hidden = false;
+            $('signOut').hidden = false;
+            render(await res.json());
+            setStatus('live', true);
+        } catch {
+            setStatus('offline — retrying', false);
+        }
+        if (!document.hidden) timer = setTimeout(poll, POLL_MS);
+    }
+
+    // Don't poll in a background tab; resume immediately when visible again.
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) { clearTimeout(timer); setStatus('paused', false); }
+        else if ($('gate').hidden) poll();
+    });
+
+    $('gateForm').addEventListener('submit', (e) => {
+        e.preventDefault();
+        localStorage.setItem(PASSWORD_KEY, $('password').value.trim());
+        $('password').value = '';
+        poll();
+    });
+
+    $('signOut').addEventListener('click', () => {
+        localStorage.removeItem(PASSWORD_KEY);
+        showGate();
+    });
+
+    $('themeToggle').addEventListener('click', () => {
+        const dark = document.documentElement.classList.toggle('dark');
+        localStorage.setItem('theme', dark ? 'dark' : 'light');
+    });
+
+    poll();
+})();
+</script>
+</body>
+</html>

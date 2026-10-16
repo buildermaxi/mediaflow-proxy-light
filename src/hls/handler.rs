@@ -110,7 +110,6 @@ pub async fn hls_manifest_handler(
         Ok(result) => result,
         Err(_) => {
             let body = graceful_end_playlist("Stream unavailable");
-            metrics.add_bytes_out(body.len() as u64);
             return Ok(HttpResponse::Ok()
                 .content_type("application/vnd.apple.mpegurl")
                 .body(body));
@@ -148,13 +147,11 @@ pub async fn hls_manifest_handler(
     // Validate that we got a real M3U8
     if !processed.contains("#EXTM3U") {
         let body = error_playlist("Invalid upstream response");
-        metrics.add_bytes_out(body.len() as u64);
         return Ok(HttpResponse::Ok()
             .content_type("application/vnd.apple.mpegurl")
             .body(body));
     }
 
-    metrics.add_bytes_out(processed.len() as u64);
     Ok(HttpResponse::Ok()
         .content_type("application/vnd.apple.mpegurl")
         .insert_header(("cache-control", "no-cache, no-store"))

@@ -18,7 +18,6 @@ use actix_web::{
     HttpRequest, HttpResponse,
 };
 use futures::stream;
-use futures::StreamExt;
 
 use crate::{
     config::Config,
@@ -323,13 +322,6 @@ pub async fn telegram_stream_handler(
         // GET: stream body
         let byte_stream =
             stream_document_range(client, tg_cfg.clone(), location, dc_id, start, end).await;
-        let metrics_clone = Arc::clone(&metrics);
-        let byte_stream = byte_stream.map(move |chunk| {
-            if let Ok(ref b) = chunk {
-                metrics_clone.add_bytes_out(b.len() as u64);
-            }
-            chunk
-        });
         let response_stream = ResponseStream::new(byte_stream);
 
         Ok(response
