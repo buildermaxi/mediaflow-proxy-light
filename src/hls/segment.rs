@@ -76,10 +76,16 @@ pub async fn hls_segment_handler(
     }
 
     if !has_range {
-        if let Some(bytes) = hls_prebuffer
+        let cached = hls_prebuffer
             .get_cached_segment(&proxy_data.destination, &pass_headers)
-            .await
-        {
+            .await;
+        let counter = if cached.is_some() {
+            &metrics.prebuffer_hits
+        } else {
+            &metrics.prebuffer_misses
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(bytes) = cached {
             let content_len = bytes.len();
             let mut resp = HttpResponse::Ok();
             resp.content_type(hls_segment_content_type(&proxy_data.destination));

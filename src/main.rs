@@ -88,7 +88,10 @@ async fn main() -> std::io::Result<()> {
     }
 
     let auth_middleware = AuthMiddleware::new(config.auth.api_password.clone());
-    let stream_manager = StreamManager::new(config.proxy.clone());
+    let app_metrics = AppMetrics::new();
+    metrics::history::spawn_sampler(app_metrics.clone());
+    let stream_manager =
+        StreamManager::new(config.proxy.clone()).with_upstream_stats(app_metrics.upstream.clone());
 
     // Resolve MediaFlow's public IP for {mediaflow_ip} placeholder substitution.
     // Use configured value if present; otherwise auto-detect via ipify/checkip.
@@ -115,7 +118,6 @@ async fn main() -> std::io::Result<()> {
     }
     let forward_config = web::Data::new(forward_cfg);
     let server_config = Arc::new(config.clone());
-    let app_metrics = AppMetrics::new();
 
     // MPD bytes cache: avoid re-fetching the (often 1 MB+) MPD for every parallel
     // playlist request (mpv opens one per audio/video track simultaneously).
@@ -168,7 +170,11 @@ async fn main() -> std::io::Result<()> {
 
         let mut app = App::new()
             .wrap(cors)
-            .wrap(Logger::new("%a - \"%r\" %s").exclude("/dashboard/stats"))
+            .wrap(
+                Logger::new("%a - \"%r\" %s")
+                    .exclude("/dashboard/stats")
+                    .exclude("/dashboard/history"),
+            )
             // Compress::default() is intentionally omitted: the proxy streams
             // binary media (video/audio) that is already compressed.  Applying
             // gzip/brotli to such data burns CPU with zero gain and — worse —
@@ -218,6 +224,10 @@ async fn main() -> std::io::Result<()> {
             .route(
                 "/dashboard/stats",
                 web::get().to(metrics::dashboard::dashboard_stats_handler),
+            )
+            .route(
+                "/dashboard/history",
+                web::get().to(metrics::dashboard::dashboard_history_handler),
             );
 
         // HLS routes (Phase 1)

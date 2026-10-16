@@ -1,15 +1,16 @@
 //! Backend for the web dashboard (`static/dashboard.html`).
 //!
-//! - `GET /dashboard`       — redirect to the dashboard page
-//! - `GET /dashboard/stats` — tiny JSON snapshot, polled by the page
+//! - `GET /dashboard`         — redirect to the dashboard page
+//! - `GET /dashboard/stats`   — live snapshot, polled every couple of seconds
+//! - `GET /dashboard/history` — last 24 h in 5-minute buckets, polled each minute
 //!
-//! The stats endpoint authenticates itself with `Authorization: Bearer
+//! Both feeds authenticate themselves with `Authorization: Bearer
 //! <api_password>` — a header rather than `?api_password=` so the secret
-//! doesn't land in the access log on every poll. It is refused outright when
-//! no `api_password` is configured, so the dashboard is never public.
+//! doesn't land in the access log on every poll. They are refused outright
+//! when no `api_password` is configured, so the dashboard is never public.
 //!
-//! Bandwidth is deliberately not computed here: the page derives it from
-//! successive `bytes_out` samples, which keeps the server stateless.
+//! Live rates (bandwidth, CPU, per-client speed) are not computed here: the
+//! page derives them from successive cumulative counters.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -17,7 +18,7 @@ use std::sync::Arc;
 use actix_web::{http::header, web, HttpRequest, HttpResponse};
 use serde::Serialize;
 
-use super::AppMetrics;
+use super::{clients::ClientView, system, upstream::HostView, AppMetrics, StreamKind};
 use crate::config::Config;
 use crate::error::{AppError, AppResult};
 
@@ -26,9 +27,57 @@ struct DashboardStats {
     uptime_secs: u64,
     /// Resident memory of this process; `null` on unsupported platforms.
     memory_rss_bytes: Option<u64>,
+    /// Cumulative CPU time; `null` on unsupported platforms.
+    cpu_time_ms: Option<u64>,
+    cpu_cores: usize,
     active_clients: usize,
     active_streams: u64,
     bytes_out: u64,
+    kinds: Vec<KindStats>,
+    /// Media responses / failures over roughly the last five minutes.
+    recent_responses: u64,
+    recent_failures: u64,
+    clients: Vec<ClientView>,
+    upstreams: Vec<HostView>,
+    services: Services,
+}
+
+#[derive(Serialize)]
+struct KindStats {
+    kind: StreamKind,
+    bytes: u64,
+    open_streams: u64,
+}
+
+/// Status of optional subsystems; a field is absent when its feature isn't compiled in.
+#[derive(Default, Serialize)]
+struct Services {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hls_prebuffer: Option<PrebufferStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    telegram: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    acestream: Option<AcestreamStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transcode: Option<TranscodeStatus>,
+}
+
+#[derive(Serialize)]
+struct PrebufferStatus {
+    hits: u64,
+    misses: u64,
+}
+
+#[derive(Serialize)]
+struct AcestreamStatus {
+    streams: u64,
+}
+
+#[derive(Serialize)]
+struct TranscodeStatus {
+    enabled: bool,
+    encoder: &'static str,
+    jobs: u64,
 }
 
 pub async fn dashboard_redirect_handler() -> HttpResponse {
@@ -44,15 +93,78 @@ pub async fn dashboard_stats_handler(
 ) -> AppResult<HttpResponse> {
     authorize(&req, &config.auth.api_password)?;
 
-    Ok(HttpResponse::Ok()
+    let (recent_responses, recent_failures) = metrics.recent_outcomes();
+    let stats = DashboardStats {
+        uptime_secs: metrics.uptime_secs(),
+        memory_rss_bytes: system::resident_memory_bytes(),
+        cpu_time_ms: system::cpu_time().map(|t| t.as_millis() as u64),
+        cpu_cores: system::cpu_cores(),
+        active_clients: metrics.active_clients(),
+        active_streams: metrics.active_connections.load(Ordering::Relaxed),
+        bytes_out: metrics.bytes_out.load(Ordering::Relaxed),
+        kinds: StreamKind::ALL
+            .iter()
+            .map(|&kind| KindStats {
+                kind,
+                bytes: metrics.bytes_served(kind),
+                open_streams: metrics.open_streams(kind),
+            })
+            .collect(),
+        recent_responses,
+        recent_failures,
+        clients: metrics.clients(),
+        upstreams: metrics.upstream.snapshot(),
+        services: services(&config, &metrics).await,
+    };
+    Ok(no_store(stats))
+}
+
+pub async fn dashboard_history_handler(
+    req: HttpRequest,
+    config: web::Data<Arc<Config>>,
+    metrics: web::Data<Arc<AppMetrics>>,
+) -> AppResult<HttpResponse> {
+    authorize(&req, &config.auth.api_password)?;
+    Ok(no_store(metrics.history()))
+}
+
+fn no_store(body: impl Serialize) -> HttpResponse {
+    HttpResponse::Ok()
         .insert_header((header::CACHE_CONTROL, "no-store"))
-        .json(DashboardStats {
-            uptime_secs: metrics.uptime_secs(),
-            memory_rss_bytes: resident_memory_bytes(),
-            active_clients: metrics.active_clients(),
-            active_streams: metrics.active_connections.load(Ordering::Relaxed),
-            bytes_out: metrics.bytes_out.load(Ordering::Relaxed),
-        }))
+        .json(body)
+}
+
+// Every field is feature-gated, so with a minimal feature set nothing is used.
+#[allow(unused_mut, unused_variables)]
+async fn services(config: &Config, metrics: &AppMetrics) -> Services {
+    let mut services = Services::default();
+    #[cfg(feature = "hls")]
+    {
+        services.hls_prebuffer = Some(PrebufferStatus {
+            hits: metrics.prebuffer_hits.load(Ordering::Relaxed),
+            misses: metrics.prebuffer_misses.load(Ordering::Relaxed),
+        });
+    }
+    #[cfg(feature = "telegram")]
+    {
+        services.telegram =
+            Some(crate::telegram::handler::connection_status(&config.telegram).await);
+    }
+    #[cfg(feature = "acestream")]
+    {
+        services.acestream = Some(AcestreamStatus {
+            streams: metrics.open_streams(StreamKind::Acestream),
+        });
+    }
+    #[cfg(feature = "transcode")]
+    {
+        services.transcode = Some(TranscodeStatus {
+            enabled: config.transcode.enabled,
+            encoder: crate::transcode::hw_detect::cached_encoder(),
+            jobs: metrics.open_streams(StreamKind::Transcode),
+        });
+    }
+    services
 }
 
 fn authorize(req: &HttpRequest, api_password: &str) -> AppResult<()> {
@@ -74,45 +186,6 @@ fn authorize(req: &HttpRequest, api_password: &str) -> AppResult<()> {
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
-/// Resident set size of this process, in bytes.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn resident_memory_bytes() -> Option<u64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    let kib = status
-        .lines()
-        .find_map(|line| line.strip_prefix("VmRSS:"))?
-        .trim()
-        .strip_suffix("kB")?
-        .trim()
-        .parse::<u64>()
-        .ok()?;
-    Some(kib * 1024)
-}
-
-/// Resident set size of this process, in bytes.
-#[cfg(target_vendor = "apple")]
-fn resident_memory_bytes() -> Option<u64> {
-    let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::uninit();
-    let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
-    // SAFETY: `info` is a writable buffer of exactly `size` bytes, which is
-    // what PROC_PIDTASKINFO fills; it is only read after a full-size write.
-    let written = unsafe {
-        libc::proc_pidinfo(
-            std::process::id() as libc::c_int,
-            libc::PROC_PIDTASKINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            size,
-        )
-    };
-    (written == size).then(|| unsafe { info.assume_init() }.pti_resident_size)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-fn resident_memory_bytes() -> Option<u64> {
-    None
 }
 
 #[cfg(test)]
@@ -140,16 +213,5 @@ mod tests {
             Err(AppError::Auth(_))
         ));
         assert!(matches!(authorize(&ok, ""), Err(AppError::Forbidden(_))));
-    }
-
-    #[test]
-    fn reads_resident_memory_where_supported() {
-        if cfg!(any(
-            target_os = "linux",
-            target_os = "android",
-            target_vendor = "apple"
-        )) {
-            assert!(resident_memory_bytes().is_some_and(|b| b > 0));
-        }
     }
 }

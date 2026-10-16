@@ -28,6 +28,7 @@ const OPEN_ENDPOINTS: &[&str] = &[
     // (header, so the secret stays out of access logs on every poll).
     "/dashboard",
     "/dashboard/stats",
+    "/dashboard/history",
 ];
 
 /// Static web UI assets (html/js/css/images) are public — they contain no secrets.
