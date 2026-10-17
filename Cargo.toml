@@ -1,6 +1,6 @@
 [package]
 name = "mediaflow-proxy-light"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2021"
 
 # Ignore dependencies that cargo-machete flags but are legitimately behind
