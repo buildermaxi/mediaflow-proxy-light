@@ -9,6 +9,8 @@
 
 ARG TARGETPLATFORM
 ARG RELEASE_VERSION
+# owner/repo hosting the release assets (passed by CI from github.repository)
+ARG GITHUB_REPOSITORY=buildermaxi/mediaflow-proxy-light
 
 # ── Downloader stage ───────────────────────────────────────────────────────
 # Grabs the architecture-appropriate binary from the GitHub Release that
@@ -17,6 +19,7 @@ ARG RELEASE_VERSION
 FROM alpine:3.21 AS downloader
 ARG TARGETPLATFORM
 ARG RELEASE_VERSION
+ARG GITHUB_REPOSITORY
 
 RUN apk add --no-cache curl ca-certificates
 
@@ -30,7 +33,7 @@ RUN case "$TARGETPLATFORM" in \
     echo "Downloading $BINARY_NAME for $TARGETPLATFORM (release: ${RELEASE_VERSION})" && \
     curl -fL --retry 3 --retry-delay 2 \
         -o mediaflow-proxy-light \
-        "https://github.com/mhdzumair/MediaFlow-Proxy-Light/releases/download/${RELEASE_VERSION}/${BINARY_NAME}" && \
+        "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_VERSION}/${BINARY_NAME}" && \
     chmod +x mediaflow-proxy-light
 
 # ── Runtime stage ──────────────────────────────────────────────────────────
