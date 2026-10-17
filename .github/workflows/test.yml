@@ -1,10 +1,15 @@
 name: Test
 
+# PRs only: the merge to main would just re-run the exact same checks.
 on:
-  push:
-    branches: [ main ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
+
+# A new push to a PR cancels its still-running previous run.
+concurrency:
+  group: test-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
