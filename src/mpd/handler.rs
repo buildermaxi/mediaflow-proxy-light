@@ -236,7 +236,6 @@ pub async fn mpd_manifest_handler(
     // Build HLS master manifest
     let hls = build_hls_master(&parsed, &proxy_base, &destination, &params);
 
-    metrics.add_bytes_out(hls.len() as u64);
     Ok(HttpResponse::Ok()
         .content_type("application/vnd.apple.mpegurl")
         .insert_header(("cache-control", "no-cache, no-store"))
@@ -323,7 +322,6 @@ pub async fn mpd_playlist_handler(
         config.mpd.live_playlist_depth,
     );
 
-    metrics.add_bytes_out(hls.len() as u64);
     Ok(HttpResponse::Ok()
         .content_type("application/vnd.apple.mpegurl")
         .insert_header(("cache-control", "no-cache, no-store"))
@@ -465,7 +463,6 @@ pub async fn mpd_segment_handler(
         let decrypted =
             crate::drm::cenc::decrypt_segment(&init_bytes, &segment_bytes, kid, k, !use_map)
                 .map_err(AppError::Drm)?;
-        metrics.add_bytes_out(decrypted.len() as u64);
         return Ok(HttpResponse::Ok()
             .content_type(mime_type_to_content_type(&mime_type, &query))
             .body(bytes::Bytes::from(decrypted)));
@@ -482,7 +479,6 @@ pub async fn mpd_segment_handler(
     };
 
     let content_type = mime_type_to_content_type(&mime_type, &query);
-    metrics.add_bytes_out(body.len() as u64);
     Ok(HttpResponse::Ok().content_type(content_type).body(body))
 }
 
@@ -541,7 +537,6 @@ pub async fn mpd_init_handler(
 
     let content_type = mime_type_to_content_type(&mime_type, &query);
 
-    metrics.add_bytes_out(init_bytes.len() as u64);
     Ok(HttpResponse::Ok()
         .content_type(content_type)
         .insert_header(("cache-control", "no-cache"))

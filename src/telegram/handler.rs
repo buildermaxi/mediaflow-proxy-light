@@ -18,7 +18,6 @@ use actix_web::{
     HttpRequest, HttpResponse,
 };
 use futures::stream;
-use futures::StreamExt;
 
 use crate::{
     config::Config,
@@ -323,13 +322,6 @@ pub async fn telegram_stream_handler(
         // GET: stream body
         let byte_stream =
             stream_document_range(client, tg_cfg.clone(), location, dc_id, start, end).await;
-        let metrics_clone = Arc::clone(&metrics);
-        let byte_stream = byte_stream.map(move |chunk| {
-            if let Ok(ref b) = chunk {
-                metrics_clone.add_bytes_out(b.len() as u64);
-            }
-            chunk
-        });
         let response_stream = ResponseStream::new(byte_stream);
 
         Ok(response
@@ -371,30 +363,33 @@ pub async fn telegram_info_handler(
 // ---------------------------------------------------------------------------
 
 pub async fn telegram_status_handler(config: web::Data<Arc<Config>>) -> AppResult<HttpResponse> {
-    let manager = get_manager();
-    let mgr = manager.read().await;
-
     // The web UI's status widget (static/url_generator.html) switches on a
     // string `status` field: "connected" / "ready" / "disabled" /
     // "not_connected".  Emit both the legacy boolean + the string shape so
     // older callers still work.
+    let status = connection_status(&config.telegram).await;
     let configured =
         crate::telegram::session::TelegramSessionManager::is_configured(&config.telegram);
-    let connected = mgr.is_authorized();
-    let status = if !configured {
-        "disabled"
-    } else if connected {
-        "connected"
-    } else {
-        "not_connected"
-    };
+    let manager = get_manager();
+    let mgr = manager.read().await;
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "status": status,
-        "connected": connected,
+        "connected": mgr.is_authorized(),
         "configured": configured,
         "session_file": mgr.session_file,
     })))
+}
+
+/// `"connected"`, `"not_connected"` or `"disabled"` (no credentials configured).
+pub async fn connection_status(config: &crate::config::TelegramConfig) -> &'static str {
+    if !crate::telegram::session::TelegramSessionManager::is_configured(config) {
+        "disabled"
+    } else if get_manager().read().await.is_authorized() {
+        "connected"
+    } else {
+        "not_connected"
+    }
 }
 
 // ---------------------------------------------------------------------------

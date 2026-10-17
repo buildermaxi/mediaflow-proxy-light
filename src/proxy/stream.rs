@@ -4,6 +4,7 @@ use futures::{Stream, StreamExt};
 use reqwest::{Client, Proxy, Response};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Semaphore;
 use tokio::time::{timeout, Duration};
 use tracing::error;
@@ -11,6 +12,7 @@ use tracing::error;
 use crate::{
     config::{ProxyConfig, ProxyRouteConfig, ProxyRouter},
     error::{AppError, AppResult},
+    metrics::upstream::{ByteTally, UpstreamStats},
 };
 
 #[derive(Clone)]
@@ -33,6 +35,8 @@ pub struct StreamManager {
     per_host_semaphores: Arc<DashMap<String, Arc<Semaphore>>>,
     config: ProxyConfig,
     proxy_router: ProxyRouter,
+    /// Per-host health for the dashboard; `None` when not wired up.
+    upstream_stats: Option<Arc<UpstreamStats>>,
 }
 
 impl StreamManager {
@@ -47,6 +51,35 @@ impl StreamManager {
             per_host_semaphores: Arc::new(DashMap::new()),
             config,
             proxy_router,
+            upstream_stats: None,
+        }
+    }
+
+    /// Report per-host time-to-first-byte, failures and body bytes to `stats`.
+    pub fn with_upstream_stats(mut self, stats: Arc<UpstreamStats>) -> Self {
+        self.upstream_stats = Some(stats);
+        self
+    }
+
+    fn record_upstream<E>(
+        &self,
+        url: &str,
+        started: Instant,
+        sent: &Result<Result<Response, reqwest::Error>, E>,
+    ) -> ByteTally {
+        let Some(stats) = &self.upstream_stats else {
+            return ByteTally::default();
+        };
+        match sent {
+            Ok(Ok(response)) => {
+                let status = response.status();
+                let failed = status.is_client_error() || status.is_server_error();
+                stats.record_response(url, started.elapsed(), failed)
+            }
+            _ => {
+                stats.record_unreachable(url);
+                ByteTally::default()
+            }
         }
     }
 
@@ -190,7 +223,9 @@ impl StreamManager {
         // this function returns.  For streaming callers, prefer
         // `create_stream` which carries the permit with the body.
         let _permit = self.acquire_host_permit(&url).await?;
-        self.make_request_raw(url, headers).await
+        self.make_request_raw(url, headers)
+            .await
+            .map(|(response, _)| response)
     }
 
     /// Acquire a permit from the per-host semaphore.  Returns an owned permit
@@ -214,11 +249,12 @@ impl StreamManager {
 
     /// Inner request without the per-host limiter — used when the caller
     /// has already acquired a permit and wants to carry it with the body.
+    /// The returned tally counts body bytes against the upstream host.
     async fn make_request_raw(
         &self,
         url: String,
         headers: reqwest::header::HeaderMap,
-    ) -> AppResult<Response> {
+    ) -> AppResult<(Response, ByteTally)> {
         let proxy_config = self.proxy_router.get_proxy_config(&url);
 
         let client = if let Some(route_config) = proxy_config {
@@ -246,8 +282,10 @@ impl StreamManager {
         // live MPEG-TS or other indefinite streams are never cut off.
         let header_timeout =
             Duration::from_secs(self.config.connect_timeout * self.config.request_timeout_factor);
-        let response = timeout(header_timeout, client.get(&url).headers(headers).send())
-            .await
+        let started = Instant::now();
+        let sent = timeout(header_timeout, client.get(&url).headers(headers).send()).await;
+        let tally = self.record_upstream(&url, started, &sent);
+        let response = sent
             .map_err(|_| {
                 AppError::Proxy(format!(
                     "Request timed out after {} s waiting for response headers from {url}",
@@ -265,7 +303,7 @@ impl StreamManager {
             )));
         }
 
-        Ok(response)
+        Ok((response, tally))
     }
 
     /// Forward an arbitrary HTTP request (any method + body) to `url` and return the full response.
@@ -306,8 +344,10 @@ impl StreamManager {
             req = req.body(body);
         }
 
-        let response = timeout(header_timeout, req.send())
-            .await
+        let started = Instant::now();
+        let sent = timeout(header_timeout, req.send()).await;
+        self.record_upstream(&url, started, &sent);
+        let response = sent
             .map_err(|_| {
                 AppError::Proxy(format!(
                     "Request timed out after {} s waiting for response headers from {url}",
@@ -344,7 +384,10 @@ impl StreamManager {
         headers: reqwest::header::HeaderMap,
     ) -> AppResult<(bytes::Bytes, String)> {
         let body_timeout = Duration::from_secs(self.config.body_read_timeout);
-        let response = self.make_request(url, headers).await?;
+        let (response, tally) = {
+            let _permit = self.acquire_host_permit(&url).await?;
+            self.make_request_raw(url, headers).await?
+        };
         let final_url = response.url().to_string();
         let bytes = timeout(body_timeout, response.bytes())
             .await
@@ -355,6 +398,7 @@ impl StreamManager {
                 ))
             })?
             .map_err(|e| AppError::Proxy(format!("Failed to read response body: {}", e)))?;
+        tally.add(bytes.len());
 
         Ok((bytes, final_url))
     }
@@ -379,7 +423,7 @@ impl StreamManager {
         //
         // Returns `None` when the limiter is disabled (max_concurrent_per_host = 0).
         let permit = self.acquire_host_permit(&url).await?;
-        let response = self.make_request_raw(url, headers).await?;
+        let (response, tally) = self.make_request_raw(url, headers).await?;
         let status = response.status();
         let response_headers = response.headers().clone();
 
@@ -396,6 +440,9 @@ impl StreamManager {
             // Keep the permit alive for each chunk's poll — it drops
             // when the stream is exhausted or cancelled.
             let _keep = &permit;
+            if let Ok(chunk) = &result {
+                tally.add(chunk.len());
+            }
             result.map_err(|e| AppError::Proxy(format!("Stream error: {}", e)))
         });
         Ok((status, response_headers, Some(stream)))

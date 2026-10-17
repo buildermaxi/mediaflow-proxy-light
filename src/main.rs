@@ -1,5 +1,5 @@
 use actix_cors::Cors;
-use actix_web::middleware::Logger;
+use actix_web::middleware::{from_fn, Logger};
 use actix_web::{web, App, HttpServer};
 use std::sync::Arc;
 use tracing_subscriber::{fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt};
@@ -88,7 +88,10 @@ async fn main() -> std::io::Result<()> {
     }
 
     let auth_middleware = AuthMiddleware::new(config.auth.api_password.clone());
-    let stream_manager = StreamManager::new(config.proxy.clone());
+    let app_metrics = AppMetrics::new();
+    metrics::history::spawn_sampler(app_metrics.clone());
+    let stream_manager =
+        StreamManager::new(config.proxy.clone()).with_upstream_stats(app_metrics.upstream.clone());
 
     // Resolve MediaFlow's public IP for {mediaflow_ip} placeholder substitution.
     // Use configured value if present; otherwise auto-detect via ipify/checkip.
@@ -115,7 +118,6 @@ async fn main() -> std::io::Result<()> {
     }
     let forward_config = web::Data::new(forward_cfg);
     let server_config = Arc::new(config.clone());
-    let app_metrics = AppMetrics::new();
 
     // MPD bytes cache: avoid re-fetching the (often 1 MB+) MPD for every parallel
     // playlist request (mpv opens one per audio/video track simultaneously).
@@ -168,12 +170,18 @@ async fn main() -> std::io::Result<()> {
 
         let mut app = App::new()
             .wrap(cors)
-            .wrap(Logger::new("%a - \"%r\" %s"))
+            .wrap(
+                Logger::new("%a - \"%r\" %s")
+                    .exclude("/dashboard/stats")
+                    .exclude("/dashboard/history"),
+            )
             // Compress::default() is intentionally omitted: the proxy streams
             // binary media (video/audio) that is already compressed.  Applying
             // gzip/brotli to such data burns CPU with zero gain and — worse —
             // actix's Compress wrapper buffers each streaming chunk before
             // encoding, which badly hurts streaming throughput.
+            // Traffic meter sits inside auth so only authenticated traffic counts.
+            .wrap(from_fn(metrics::traffic::traffic_meter))
             .wrap(auth_middleware.clone())
             .app_data(web::Data::new(stream_manager.clone()))
             .app_data(web::Data::new(config.clone()))
@@ -207,7 +215,20 @@ async fn main() -> std::io::Result<()> {
             // Health check
             .service(web::scope("/health").route("", web::get().to(|| async { "OK" })))
             // Usage metrics (unauthenticated — data is not sensitive)
-            .route("/metrics", web::get().to(metrics::metrics_handler));
+            .route("/metrics", web::get().to(metrics::metrics_handler))
+            // Live usage dashboard (page: static/dashboard.html)
+            .route(
+                "/dashboard",
+                web::get().to(metrics::dashboard::dashboard_redirect_handler),
+            )
+            .route(
+                "/dashboard/stats",
+                web::get().to(metrics::dashboard::dashboard_stats_handler),
+            )
+            .route(
+                "/dashboard/history",
+                web::get().to(metrics::dashboard::dashboard_history_handler),
+            );
 
         // HLS routes (Phase 1)
         // Both semantic paths (/manifest) and Python-style .m3u8 paths are registered.

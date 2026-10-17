@@ -2157,6 +2157,7 @@ dependencies = [
  "grammers-tl-types",
  "hex",
  "hmac",
+ "libc",
  "m3u8-rs",
  "mime_guess",
  "moka",

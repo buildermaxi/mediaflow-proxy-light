@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard · MediaFlow Proxy Light</title>
+    <link rel="icon" href="/logo.png">
+    <script>
+        // Apply the shared theme before first paint (same key as the other pages).
+        document.documentElement.classList.toggle('dark', localStorage.getItem('theme') === 'dark');
+    </script>
+    <style>
+        :root {
+            color-scheme: light;
+            --bg: #f4f4f2;
+            --surface: #fcfcfb;
+            --border: #e4e3df;
+            --text: #0b0b0b;
+            --text-2: #52514e;
+            --muted: #807f7a;
+            --danger: #c62828;
+            --warning: #b45309;
+            --success: #1a8f5a;
+            /* One fixed color per stream type (validated categorical order). */
+            --k-hls: #2a78d6;
+            --k-dash: #eb6834;
+            --k-direct: #1baf7a;
+            --k-xtream: #eda100;
+            --k-telegram: #e87ba4;
+            --k-acestream: #008300;
+            --k-transcode: #6250d6;
+            --k-other: #a3a29c;
+        }
+        html.dark {
+            color-scheme: dark;
+            --bg: #111110;
+            --surface: #1a1a19;
+            --border: #2e2e2c;
+            --text: #f0efec;
+            --text-2: #c3c2b7;
+            --muted: #8f8e86;
+            --danger: #ef6b6b;
+            --warning: #f0a33a;
+            --success: #3fbf7f;
+            --k-hls: #3987e5;
+            --k-dash: #d95926;
+            --k-direct: #199e70;
+            --k-xtream: #c98500;
+            --k-telegram: #d55181;
+            --k-acestream: #008300;
+            --k-transcode: #9085e9;
+            --k-other: #6f6e69;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            min-height: 100vh;
+            background: var(--bg);
+            color: var(--text);
+            font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+        }
+        main { max-width: 1000px; margin: 0 auto; padding: 36px 20px; }
+        header { display: flex; align-items: center; gap: 12px; margin-bottom: 24px; }
+        h1 { font-size: 22px; font-weight: 600; margin: 0; }
+        h2 { font-size: 13px; font-weight: 600; margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
+        h2 .note { font-weight: 400; color: var(--muted); }
+        a, button.link { color: var(--text-2); font: inherit; font-size: 13px; }
+        .spacer { flex: 1; }
+        .status { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
+        .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+        .dot.ok { background: var(--success); }
+        .dot.warn { background: var(--warning); }
+        .dot.off { opacity: .5; }
+        button {
+            font: inherit; cursor: pointer; border-radius: 8px;
+            border: 1px solid var(--border); background: var(--surface); color: var(--text);
+            padding: 6px 12px;
+        }
+        button.link { border: 0; background: none; padding: 0; text-decoration: underline; }
+        .card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 18px; }
+        .stack { display: flex; flex-direction: column; gap: 14px; }
+        .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+        .tile { padding: 14px 16px; }
+        .label { font-size: 13px; color: var(--text-2); }
+        .value { font-size: 28px; font-weight: 600; margin: 2px 0; letter-spacing: -0.01em; white-space: nowrap; }
+        .value small { font-size: 14px; font-weight: 500; color: var(--muted); margin-left: 4px; letter-spacing: 0; }
+        .sub { font-size: 12px; color: var(--muted); min-height: 1.45em; }
+
+        .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 999px; overflow: hidden; }
+        .seg button { border: 0; border-radius: 0; padding: 3px 10px; font-size: 12px; background: none; color: var(--muted); }
+        .seg button[aria-pressed="true"] { background: var(--border); color: var(--text); }
+        .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12px; margin-bottom: 8px; min-height: 18px; }
+        .legend i, .tip i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+        .legend b { font-weight: 600; margin-left: 4px; }
+        .chart { position: relative; }
+        .chart svg { display: block; width: 100%; height: 200px; }
+        .chart .grid line { stroke: var(--border); }
+        .chart text { fill: var(--muted); font-size: 10px; }
+        .chart .band-edge { fill: none; stroke: var(--surface); stroke-width: 2; stroke-linejoin: round; }
+        .chart .cross { stroke: var(--text); stroke-opacity: .45; }
+        .empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 13px; pointer-events: none; }
+        .tip {
+            position: absolute; top: 6px; pointer-events: none; min-width: 170px;
+            background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+            padding: 8px 10px; font-size: 12px; box-shadow: 0 4px 14px rgb(0 0 0 / .12);
+        }
+        .tip .row { display: flex; justify-content: space-between; gap: 14px; font-variant-numeric: tabular-nums; }
+        .tip .when { color: var(--muted); margin-bottom: 4px; }
+        .tip .total { margin-top: 4px; font-weight: 600; }
+
+        .two { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 14px; }
+        .scroll { overflow-x: auto; }
+        table { width: 100%; border-collapse: collapse; font-size: 12px; }
+        th { text-align: left; font-weight: 500; color: var(--muted); padding: 0 10px 6px 0; }
+        td { padding: 6px 10px 6px 0; border-top: 1px solid var(--border); white-space: nowrap; }
+        th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; padding: 0 0 6px 10px; }
+        td.num { padding: 6px 0 6px 10px; }
+        td.none { color: var(--muted); text-align: center; padding: 14px 0; }
+        .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+        .idle { color: var(--muted); }
+        .bar { display: inline-block; height: 6px; border-radius: 3px; background: var(--k-hls); vertical-align: 1px; margin-right: 6px; }
+        .warn { color: var(--warning); }
+
+        .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+        .chip {
+            display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
+            padding: 5px 11px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface);
+        }
+        .chip .meta { color: var(--muted); }
+        footer { font-size: 12px; color: var(--muted); }
+
+        #gate { max-width: 380px; margin: 60px auto; }
+        #gate form { display: flex; gap: 8px; margin-top: 12px; }
+        #gate input {
+            flex: 1; font: inherit; padding: 6px 10px; border-radius: 8px;
+            border: 1px solid var(--border); background: var(--bg); color: var(--text);
+        }
+        #gate .error { color: var(--danger); font-size: 13px; margin-top: 10px; min-height: 1.45em; }
+        [hidden] { display: none !important; }
+    </style>
+</head>
+<body>
+<main>
+    <header>
+        <h1>Dashboard</h1>
+        <div class="status"><span id="dot" class="dot"></span><span id="status">connecting…</span></div>
+        <div class="spacer"></div>
+        <a href="/">Home</a>
+        <button id="signOut" class="link" hidden>Sign out</button>
+        <button id="themeToggle" aria-label="Toggle theme">◐</button>
+    </header>
+
+    <section id="gate" class="card" hidden>
+        <div class="label">Enter the API password to view live stats.</div>
+        <form id="gateForm">
+            <input id="password" type="password" autocomplete="current-password" placeholder="API password" required>
+            <button type="submit">Unlock</button>
+        </form>
+        <div id="gateError" class="error"></div>
+    </section>
+
+    <section id="stats" class="stack" hidden>
+        <div class="kpis">
+            <div class="card tile" id="tileMemory"><div class="label">Memory</div><div class="value">—</div><div class="sub"></div></div>
+            <div class="card tile" id="tileCpu"><div class="label">CPU</div><div class="value">—</div><div class="sub"></div></div>
+            <div class="card tile" id="tileUsers"><div class="label">Active users</div><div class="value">—</div><div class="sub"></div></div>
+            <div class="card tile" id="tileBandwidth"><div class="label">Bandwidth</div><div class="value">—</div><div class="sub"></div></div>
+            <div class="card tile" id="tileFailures"><div class="label">Failed requests</div><div class="value">—</div><div class="sub"></div></div>
+        </div>
+
+        <div class="card">
+            <h2>Bandwidth by stream type <span class="note" id="chartNote"></span><span class="spacer"></span>
+                <span class="seg" role="group" aria-label="Time range">
+                    <button data-mode="live" aria-pressed="true">Live</button><button data-mode="24h" aria-pressed="false">24 h</button>
+                </span>
+            </h2>
+            <div class="legend" id="legend"></div>
+            <div class="chart">
+                <svg id="chart" role="img" aria-label="Bandwidth by stream type"></svg>
+                <div class="empty" id="chartEmpty" hidden></div>
+                <div class="tip" id="tip" hidden></div>
+            </div>
+        </div>
+
+        <div class="two">
+            <div class="card scroll">
+                <h2>Users <span class="note">IPs masked</span></h2>
+                <table>
+                    <thead><tr><th>Client</th><th>Player</th><th>Watching</th><th class="num">Rate</th><th class="num">Since</th></tr></thead>
+                    <tbody id="clients"></tbody>
+                </table>
+            </div>
+            <div class="card scroll">
+                <h2>Upstream hosts <span class="note">last ~10 min</span></h2>
+                <table>
+                    <thead><tr><th>Host</th><th>Traffic</th><th class="num">Failed</th><th class="num">TTFB p95</th></tr></thead>
+                    <tbody id="hosts"></tbody>
+                </table>
+            </div>
+        </div>
+
+        <div>
+            <h2>Services</h2>
+            <div class="chips" id="services"></div>
+        </div>
+
+        <footer id="footer">Estimates · refreshed every 2 s</footer>
+    </section>
+</main>
+
+<script>
+(() => {
+    const POLL_MS = 2000;
+    const HISTORY_POLL_MS = 60000;
+    const RATE_WINDOW_MS = 10000;   // live rates = average over the last ~10 s
+    const LIVE_POINTS = 60;         // live chart: ~2 min
+    const PASSWORD_KEY = 'mediaflow_api_password';  // shared with the other tools
+    const KINDS = {
+        hls: 'HLS', dash: 'DASH', direct: 'Direct', xtream: 'Xtream',
+        telegram: 'Telegram', acestream: 'Acestream', transcode: 'Transcode', other: 'Other',
+    };
+    const KIND_ORDER = Object.keys(KINDS);
+    const kindColor = (k) => `var(--k-${k})`;
+
+    const $ = (id) => document.getElementById(id);
+    let samples = [];               // { t, bytes, kinds, cpuMs } within RATE_WINDOW_MS
+    let live = [];                  // { t, values: { kind: bytes/s } }
+    const clientSamples = new Map(); // client id -> [{ t, bytes }]
+    let history = null;             // last /dashboard/history payload
+    let current = null;             // last stats + derived rates
+    let mode = 'live';
+    let timer = null, historyTimer = null, hoverX = null;
+
+    // ── Formatting ──────────────────────────────────────────────────────────
+    const esc = (s) => String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+    function bytesParts(b) {
+        const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+        let i = 0;
+        while (b >= 1024 && i < units.length - 1) { b /= 1024; i++; }
+        return [b.toFixed(i === 0 ? 0 : b < 10 ? 1 : 0), units[i]];
+    }
+    function bitsParts(bytesPerSec) {
+        let v = bytesPerSec * 8;
+        const units = ['bit/s', 'kbit/s', 'Mbit/s', 'Gbit/s'];
+        let i = 0;
+        while (v >= 1000 && i < units.length - 1) { v /= 1000; i++; }
+        return [v.toFixed(i === 0 || v >= 100 ? 0 : 1), units[i]];
+    }
+    const fmtBytes = (b) => bytesParts(b).join(' ');
+    const fmtBits = (b) => bitsParts(b).join(' ');
+    const fmtDuration = (s) => {
+        const d = Math.floor(s / 86400), h = Math.floor(s / 3600) % 24, m = Math.floor(s / 60) % 60;
+        return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : m ? `${m}m` : `${Math.floor(s)}s`;
+    };
+    const fmtClock = (t) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+    function setTile(id, parts, sub) {
+        const el = $(id);
+        el.querySelector('.value').innerHTML = parts == null ? '—'
+            : `${esc(parts[0])}${parts[1] ? `<small>${esc(parts[1])}</small>` : ''}`;
+        el.querySelector('.sub').textContent = sub;
+    }
+
+    // ── Rates from cumulative counters ──────────────────────────────────────
+    function windowRate(list, now, value) {
+        list.push({ t: now, v: value });
+        while (list.length > 1 && now - list[0].t > RATE_WINDOW_MS) list.shift();
+        const first = list[0], last = list[list.length - 1];
+        return last.t > first.t ? (last.v - first.v) / ((last.t - first.t) / 1000) : null;
+    }
+
+    function ingest(s) {
+        const now = performance.now();
+        if (samples.length && s.bytes_out < samples[samples.length - 1].bytes) {  // server restarted
+            samples = []; live = []; clientSamples.clear();
+        }
+        const kinds = Object.fromEntries(s.kinds.map((k) => [k.kind, k.bytes]));
+        samples.push({ t: now, bytes: s.bytes_out, kinds, cpuMs: s.cpu_time_ms });
+        while (samples.length > 1 && now - samples[0].t > RATE_WINDOW_MS) samples.shift();
+        const first = samples[0], last = samples[samples.length - 1];
+        const dt = (last.t - first.t) / 1000;
+
+        let kindRates = null;
+        if (dt > 0) {
+            kindRates = Object.fromEntries(KIND_ORDER.map((k) => [k, Math.max(0, (last.kinds[k] - first.kinds[k]) / dt)]));
+            live.push({ t: Date.now(), values: kindRates });
+            if (live.length > LIVE_POINTS) live.shift();
+        }
+        const ids = new Set(s.clients.map((c) => c.id));
+        for (const id of clientSamples.keys()) if (!ids.has(id)) clientSamples.delete(id);
+        const clients = s.clients.map((c) => {
+            if (!clientSamples.has(c.id)) clientSamples.set(c.id, []);
+            return { ...c, rate: windowRate(clientSamples.get(c.id), now, c.bytes) };
+        });
+        current = {
+            ...s,
+            clients,
+            kindRates,
+            rate: dt > 0 ? (last.bytes - first.bytes) / dt : null,
+            cpu: dt > 0 && last.cpuMs != null ? ((last.cpuMs - first.cpuMs) / (dt * 1000)) / s.cpu_cores * 100 : null,
+        };
+    }
+
+    // ── Tiles ───────────────────────────────────────────────────────────────
+    function renderTiles() {
+        const s = current, peaks = history?.peaks;
+        const rss = s.memory_rss_bytes;
+        setTile('tileMemory', rss == null ? null : bytesParts(rss),
+            rss == null ? 'not available on this platform' : `24 h peak ${fmtBytes(Math.max(peaks?.rss_bytes ?? 0, rss))}`);
+
+        const jobs = s.services.transcode?.jobs ?? 0;
+        setTile('tileCpu', s.cpu == null ? null : [s.cpu.toFixed(s.cpu < 10 ? 1 : 0), '%'],
+            s.cpu_time_ms == null ? 'not available on this platform'
+                : `of ${plural(s.cpu_cores, 'core')}${jobs ? ` · ${plural(jobs, 'transcode')}` : ''}`);
+
+        setTile('tileUsers', [String(s.active_clients), ''],
+            `${plural(s.active_streams, 'stream')} · 24 h peak ${Math.max(peaks?.users ?? 0, s.active_clients)}`);
+
+        setTile('tileBandwidth', s.rate == null ? null : bitsParts(s.rate),
+            `24 h peak ${fmtBits(Math.max(peaks?.bytes_per_sec ?? 0, s.rate ?? 0))}`);
+
+        const { recent_responses: total, recent_failures: failed } = s;
+        setTile('tileFailures', total ? [(failed / total * 100).toFixed(failed && failed / total < 0.1 ? 1 : 0), '%'] : null,
+            total ? `${failed} of ${total} · 5 min` : 'no media requests · 5 min');
+
+        $('footer').textContent = `Up ${fmtDuration(s.uptime_secs)} · ${fmtBytes(s.bytes_out)} served · estimates, refreshed every ${POLL_MS / 1000} s`;
+    }
+
+    // ── Tables ──────────────────────────────────────────────────────────────
+    function renderClients() {
+        const rows = [...current.clients].sort((a, b) => (b.rate ?? -1) - (a.rate ?? -1) || b.bytes - a.bytes);
+        $('clients').innerHTML = rows.length ? rows.map((c) => `<tr>
+            <td class="mono">${esc(c.ip)}</td>
+            <td>${esc(c.player)}</td>
+            <td${c.streaming ? '' : ' class="idle" title="Between requests"'}>${esc(KINDS[c.kind] ?? c.kind)}</td>
+            <td class="num">${c.rate == null ? '—' : fmtBits(c.rate)}</td>
+            <td class="num">${fmtDuration(c.since_secs)}</td></tr>`).join('')
+            : '<tr><td class="none" colspan="5">No active users</td></tr>';
+    }
+
+    function renderHosts() {
+        const warn = (bad, text) => bad ? `<span class="warn">▲</span> ${text}` : text;
+        const ttfb = (ms) => ms == null ? '—' : ms >= 10000 ? '≥ 10 s' : ms >= 1000 ? `${ms / 1000} s` : `${ms} ms`;
+        const rows = current.upstreams;
+        $('hosts').innerHTML = rows.length ? rows.map((h) => `<tr>
+            <td class="mono">${esc(h.host)}</td>
+            <td><span class="bar" style="width:${Math.max(2, Math.round(h.share * 60))}px"></span>${Math.round(h.share * 100)}%</td>
+            <td class="num">${warn(h.failure_rate >= 0.02, `${(h.failure_rate * 100).toFixed(h.failure_rate && h.failure_rate < 0.1 ? 1 : 0)}%`)}</td>
+            <td class="num">${warn(h.ttfb_p95_ms >= 1000, ttfb(h.ttfb_p95_ms))}</td></tr>`).join('')
+            : '<tr><td class="none" colspan="4">No upstream requests yet</td></tr>';
+    }
+
+    function renderServices() {
+        const sv = current.services, chips = [];
+        const chip = (state, name, meta) => chips.push(
+            `<span class="chip"><span class="dot ${state}"></span>${esc(name)} <span class="meta">${esc(meta)}</span></span>`);
+        if (sv.hls_prebuffer) {
+            const { hits, misses } = sv.hls_prebuffer, total = hits + misses;
+            chip('ok', 'HLS prebuffer', total ? `${Math.round(hits / total * 100)}% hit rate` : 'no segments yet');
+        }
+        if (sv.telegram) {
+            const label = { connected: 'connected', not_connected: 'not connected', disabled: 'not configured' }[sv.telegram] ?? sv.telegram;
+            chip(sv.telegram === 'connected' ? 'ok' : sv.telegram === 'disabled' ? 'off' : 'warn', 'Telegram', label);
+        }
+        if (sv.acestream) chip(sv.acestream.streams ? 'ok' : 'off', 'Acestream', sv.acestream.streams ? plural(sv.acestream.streams, 'stream') : 'idle');
+        if (sv.transcode) {
+            const t = sv.transcode;
+            chip(t.enabled ? 'ok' : 'off', 'Transcode', t.enabled ? `${plural(t.jobs, 'job')} · ${t.encoder}` : 'disabled');
+        }
+        $('services').innerHTML = chips.join('') || '<span class="chip"><span class="meta">No optional services compiled in</span></span>';
+    }
+
+    // ── Stacked area chart ──────────────────────────────────────────────────
+    function chartData() {
+        const end = Date.now();
+        if (mode === 'live') return { points: live, start: end - LIVE_POINTS * POLL_MS, end };
+        if (!history) return { points: [], start: end - 864e5, end };
+        const points = history.t.map((t, i) => ({
+            t: Math.min(end, (t + history.secs[i] / 2) * 1000),
+            values: Object.fromEntries(history.series.map((s) => [s.kind, s.bytes[i] / Math.max(1, history.secs[i])])),
+        }));
+        const first = history.t.length ? history.t[0] * 1000 : end;
+        return { points, start: Math.max(end - 864e5, Math.min(first, end - 6e5)), end };
+    }
+
+    function niceStep(max) {
+        const raw = max / 4, mag = 10 ** Math.floor(Math.log10(raw));
+        return [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => s >= raw);
+    }
+
+    function renderLegend(kinds) {
+        let values;
+        if (mode === 'live') {
+            values = (k) => current?.kindRates ? fmtBits(current.kindRates[k]) : '—';
+            $('chartNote').textContent = '· last 2 min';
+        } else {
+            const total = (k) => history.series.find((s) => s.kind === k)?.bytes.reduce((a, b) => a + b, 0) ?? 0;
+            values = (k) => fmtBytes(total(k));
+            const all = history ? history.series.reduce((a, s) => a + s.bytes.reduce((x, y) => x + y, 0), 0) : 0;
+            const since = history?.t.length && Date.now() - history.t[0] * 1000 < 864e5 - 6e5
+                ? `since ${fmtClock(history.t[0] * 1000)}` : 'in 24 h';
+            $('chartNote').textContent = history ? `· ${fmtBytes(all)} ${since}` : '';
+        }
+        $('legend').innerHTML = kinds.map((k) => `<span><i style="background:${kindColor(k)}"></i>${KINDS[k]}<b>${values(k)}</b></span>`).join('');
+    }
+
+    function drawChart() {
+        const svg = $('chart'), tip = $('tip'), empty = $('chartEmpty');
+        const { points, start, end } = chartData();
+        const kinds = KIND_ORDER.filter((k) => points.some((p) => p.values[k] > 0));
+        renderLegend(kinds);
+
+        if (points.length < 2 || !kinds.length) {
+            svg.innerHTML = '';
+            tip.hidden = true;
+            empty.hidden = false;
+            empty.textContent = mode === 'live'
+                ? (live.length < 2 ? 'Collecting…' : 'No traffic in the last 2 minutes')
+                : (!history?.t.length ? 'History starts after the first minute of uptime' : 'No traffic in the last 24 hours');
+            return;
+        }
+        empty.hidden = true;
+
+        const W = svg.clientWidth || 600, H = 200, L = 38, R = 6, T = 16, B = 20;
+        svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+        const totals = points.map((p) => kinds.reduce((a, k) => a + (p.values[k] || 0), 0));
+        const maxBits = Math.max(...totals) * 8;
+        const [unit, div] = maxBits >= 1e9 ? ['Gbit/s', 1e9] : maxBits >= 1e6 ? ['Mbit/s', 1e6] : ['kbit/s', 1e3];
+        const step = niceStep(maxBits / div), yMax = Math.ceil(maxBits / div / step) * step;
+        const x = (t) => L + ((t - start) / (end - start)) * (W - L - R);
+        const y = (bytesPerSec) => T + (1 - (bytesPerSec * 8 / div) / yMax) * (H - T - B);
+
+        let out = '<g class="grid">';
+        for (let v = 0; v <= yMax + 1e-9; v += step) out += `<line x1="${L}" x2="${W - R}" y1="${y(v * div / 8)}" y2="${y(v * div / 8)}"/>`;
+        out += '</g><g>';
+        for (let v = 0; v <= yMax + 1e-9; v += step) out += `<text x="${L - 6}" y="${y(v * div / 8) + 3}" text-anchor="end">${+v.toFixed(2)}</text>`;
+        out += `<text x="0" y="9">${unit}</text>`;
+        if (mode === 'live') {
+            [[120, '2 min ago'], [60, '1 min ago'], [0, 'now']].forEach(([s, label], i) =>
+                out += `<text x="${x(end - s * 1000)}" y="${H - 5}" text-anchor="${['start', 'middle', 'end'][i]}">${label}</text>`);
+        } else {
+            // Clock-aligned ticks, about five across whatever span is shown.
+            const minutes = [5, 10, 15, 30, 60, 120, 180, 360].find((m) => (end - start) / 6e4 / m <= 6) ?? 360;
+            const tick = new Date(start); tick.setSeconds(0, 0);
+            tick.setMinutes(Math.ceil((tick.getHours() * 60 + tick.getMinutes()) / minutes) * minutes - tick.getHours() * 60);
+            for (; tick <= end; tick.setMinutes(tick.getMinutes() + minutes)) {
+                const tx = x(+tick);
+                if (tx > L + 20 && tx < W - R - 20) out += `<text x="${tx}" y="${H - 5}" text-anchor="middle">${fmtClock(+tick)}</text>`;
+            }
+        }
+        out += '</g>';
+
+        const base = points.map(() => 0);
+        for (const k of kinds) {
+            const top = points.map((p, i) => base[i] + (p.values[k] || 0));
+            const upper = points.map((p, i) => `${x(p.t).toFixed(1)},${y(top[i]).toFixed(1)}`);
+            const lower = points.map((p, i) => `${x(p.t).toFixed(1)},${y(base[i]).toFixed(1)}`).reverse();
+            out += `<path d="M${upper.join('L')}L${lower.join('L')}Z" fill="${kindColor(k)}"/>`;
+            out += `<path class="band-edge" d="M${upper.join('L')}"/>`;
+            top.forEach((v, i) => (base[i] = v));
+        }
+        out += `<line class="cross" y1="${T}" y2="${H - B}" visibility="hidden"/>`;
+        svg.innerHTML = out;
+
+        const showTip = (clientX) => {
+            const rect = svg.getBoundingClientRect();
+            const px = (clientX - rect.left) * (W / rect.width);
+            let i = 0;
+            points.forEach((p, j) => { if (Math.abs(x(p.t) - px) < Math.abs(x(points[i].t) - px)) i = j; });
+            const p = points[i], cross = svg.querySelector('.cross');
+            cross.setAttribute('x1', x(p.t)); cross.setAttribute('x2', x(p.t)); cross.setAttribute('visibility', 'visible');
+            const when = mode === 'live' ? (Math.round((end - p.t) / 1000) ? `${Math.round((end - p.t) / 1000)} s ago` : 'now') : fmtClock(p.t);
+            tip.innerHTML = `<div class="when">${when}</div>` +
+                [...kinds].reverse().map((k) => `<div class="row"><span><i style="background:${kindColor(k)}"></i>${KINDS[k]}</span><span>${fmtBits(p.values[k] || 0)}</span></div>`).join('') +
+                `<div class="row total"><span>Total</span><span>${fmtBits(totals[i])}</span></div>`;
+            tip.hidden = false;
+            const cx = x(p.t) * (rect.width / W), tw = tip.offsetWidth;
+            tip.style.left = `${cx + 12 + tw > rect.width ? cx - tw - 12 : cx + 12}px`;
+        };
+        svg.onmousemove = (e) => { hoverX = e.clientX; showTip(hoverX); };
+        svg.onmouseleave = () => { hoverX = null; tip.hidden = true; svg.querySelector('.cross')?.setAttribute('visibility', 'hidden'); };
+        if (hoverX != null) showTip(hoverX);
+    }
+
+    // ── Data loading ────────────────────────────────────────────────────────
+    class Locked extends Error {}
+
+    async function api(path) {
+        const password = localStorage.getItem(PASSWORD_KEY);
+        if (!password) throw new Locked('');
+        const res = await fetch(path, { headers: { Authorization: `Bearer ${password}` }, cache: 'no-store' });
+        if (res.status === 401) throw new Locked('Wrong API password.');
+        if (!res.ok) {
+            const body = await res.json().catch(() => ({}));
+            throw new Locked(body.error || `Server error (${res.status}).`);
+        }
+        return res.json();
+    }
+
+    function setStatus(text, ok) {
+        $('status').textContent = text;
+        $('dot').className = `dot${ok ? ' ok' : ''}`;
+    }
+
+    function showGate(message) {
+        clearTimeout(timer);
+        clearTimeout(historyTimer);
+        $('stats').hidden = true;
+        $('signOut').hidden = true;
+        $('gate').hidden = false;
+        $('gateError').textContent = message || '';
+        setStatus('locked', false);
+        $('password').focus();
+    }
+
+    async function poll() {
+        clearTimeout(timer);
+        try {
+            const stats = await api('/dashboard/stats');
+            $('gate').hidden = true;
+            $('stats').hidden = false;
+            $('signOut').hidden = false;
+            ingest(stats);
+            renderTiles();
+            renderClients();
+            renderHosts();
+            renderServices();
+            if (mode === 'live') drawChart();
+            setStatus('live', true);
+        } catch (e) {
+            if (e instanceof Locked) return showGate(e.message);
+            setStatus('offline — retrying', false);
+        }
+        if (!document.hidden) timer = setTimeout(poll, POLL_MS);
+    }
+
+    async function pollHistory() {
+        clearTimeout(historyTimer);
+        try {
+            history = await api('/dashboard/history');
+            if (current) renderTiles();
+            if (mode === '24h') drawChart();
+        } catch (e) {
+            if (e instanceof Locked) return;  // poll() shows the gate
+        }
+        if (!document.hidden) historyTimer = setTimeout(pollHistory, HISTORY_POLL_MS);
+    }
+
+    function start() {
+        poll();
+        pollHistory();
+    }
+
+    // ── Controls ────────────────────────────────────────────────────────────
+    document.querySelectorAll('.seg button').forEach((btn) => btn.addEventListener('click', () => {
+        mode = btn.dataset.mode;
+        document.querySelectorAll('.seg button').forEach((b) => b.setAttribute('aria-pressed', String(b === btn)));
+        drawChart();
+    }));
+
+    // Don't poll in a background tab; resume immediately when visible again.
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+            clearTimeout(timer);
+            clearTimeout(historyTimer);
+            setStatus('paused', false);
+        } else if ($('gate').hidden) {
+            start();
+        }
+    });
+
+    $('gateForm').addEventListener('submit', (e) => {
+        e.preventDefault();
+        localStorage.setItem(PASSWORD_KEY, $('password').value.trim());
+        $('password').value = '';
+        start();
+    });
+
+    $('signOut').addEventListener('click', () => {
+        localStorage.removeItem(PASSWORD_KEY);
+        showGate();
+    });
+
+    $('themeToggle').addEventListener('click', () => {
+        const dark = document.documentElement.classList.toggle('dark');
+        localStorage.setItem('theme', dark ? 'dark' : 'light');
+    });
+
+    addEventListener('resize', () => { if (current) drawChart(); });
+
+    start();
+})();
+</script>
+</body>
+</html>

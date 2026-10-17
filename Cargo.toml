@@ -196,6 +196,10 @@ grammers-tl-types = { version = "0.7", optional = true }
 # Vendored OpenSSL (only needed for legacy builds; prefer rustls)
 openssl = { version = "0.10", features = ["vendored"], optional = true }
 
+# Process CPU time (all unix) and RSS (macOS / iOS) for the web dashboard.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # ---------------------------------------------------------------------------
 # Dev dependencies
 # ---------------------------------------------------------------------------
