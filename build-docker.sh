@@ -19,7 +19,6 @@ usage() {
     echo "Usage: $0 [OPTIONS]"
     echo "Options:"
     echo "  -t, --type TYPE     Build type: 'prebuilt', 'local', or 'source' (default: prebuilt)"
-    echo "  -v, --version VER   Release version for prebuilt (e.g., v1.0.0)"
     echo "  -p, --platforms     Docker platforms (default: linux/amd64,linux/arm64)"
     echo "  --tag TAG          Docker tag (default: mediaflow-proxy-light)"
     echo "  --push             Push to registry"
@@ -32,17 +31,12 @@ BUILD_TYPE="prebuilt"
 PLATFORMS="linux/amd64,linux/arm64"
 TAG="mediaflow-proxy-light"
 PUSH_FLAG=""
-VERSION=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
         -t|--type)
             BUILD_TYPE="$2"
-            shift 2
-            ;;
-        -v|--version)
-            VERSION="$2"
             shift 2
             ;;
         -p|--platforms)
@@ -69,21 +63,21 @@ done
 
 case $BUILD_TYPE in
     "prebuilt")
-        if [[ -z "$VERSION" ]]; then
-            echo -e "${RED}Error: Version is required for prebuilt type${NC}"
-            echo "Example: $0 -t prebuilt -v v1.0.0"
-            exit 1
-        fi
+        # Expects dist/<amd64|arm64>/mediaflow-proxy-light (see Dockerfile.prebuilt)
+        for arch in amd64 arm64; do
+            if [[ "$PLATFORMS" == *"linux/$arch"* && ! -f "dist/$arch/mediaflow-proxy-light" ]]; then
+                echo -e "${RED}Error: dist/$arch/mediaflow-proxy-light not found${NC}"
+                echo "Build the Linux binary for $arch and copy it there first."
+                exit 1
+            fi
+        done
 
-        echo -e "${YELLOW}Building using pre-built binaries from release $VERSION${NC}"
+        echo -e "${YELLOW}Building using pre-built binaries from dist/${NC}"
         echo -e "${YELLOW}Platforms: $PLATFORMS${NC}"
-        echo -e "${YELLOW}Estimated build time: ~30 seconds${NC}"
 
         docker buildx build \
             -f Dockerfile.prebuilt \
             --platform "$PLATFORMS" \
-            --build-arg RELEASE_VERSION="$VERSION" \
-            -t "$TAG:$VERSION" \
             -t "$TAG:latest" \
             $PUSH_FLAG \
             .

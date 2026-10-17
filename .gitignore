@@ -24,3 +24,4 @@ config.toml
 
 # MkDocs build output
 site/
+dist/
