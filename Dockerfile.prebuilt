@@ -1,40 +1,13 @@
 # ---------------------------------------------------------------------------
-# Docker image — built from the pre-compiled binaries produced by the
-# `build-binaries` CI job (desktop Linux x86_64 + aarch64).  This is the
-# image used by the release pipeline: no Rust toolchain, no C compiler, no
-# QEMU Rust cross-compile — just `curl` and a static copy.
+# Docker image — built from pre-compiled Linux binaries (x86_64 + aarch64),
+# as produced by the `build-binaries` job of the Publish workflow.  No Rust
+# toolchain, no C compiler, no QEMU Rust cross-compile — just a static copy.
+#
+# Expects the binaries at dist/<arch>/mediaflow-proxy-light, with <arch> being
+# Docker's TARGETARCH (amd64, arm64).
 #
 # For a local from-source build instead see `Dockerfile` in this repo.
 # ---------------------------------------------------------------------------
-
-ARG TARGETPLATFORM
-ARG RELEASE_VERSION
-# owner/repo hosting the release assets (passed by CI from github.repository)
-ARG GITHUB_REPOSITORY=buildermaxi/mediaflow-proxy-light
-
-# ── Downloader stage ───────────────────────────────────────────────────────
-# Grabs the architecture-appropriate binary from the GitHub Release that
-# triggered this build.  Alpine is used purely because it has the smallest
-# curl-containing image.
-FROM alpine:3.21 AS downloader
-ARG TARGETPLATFORM
-ARG RELEASE_VERSION
-ARG GITHUB_REPOSITORY
-
-RUN apk add --no-cache curl ca-certificates
-
-WORKDIR /tmp
-
-RUN case "$TARGETPLATFORM" in \
-        "linux/amd64") BINARY_NAME="mediaflow-proxy-light-linux-x86_64" ;; \
-        "linux/arm64") BINARY_NAME="mediaflow-proxy-light-linux-aarch64" ;; \
-        *) echo "Unsupported platform: $TARGETPLATFORM" >&2; exit 1 ;; \
-    esac && \
-    echo "Downloading $BINARY_NAME for $TARGETPLATFORM (release: ${RELEASE_VERSION})" && \
-    curl -fL --retry 3 --retry-delay 2 \
-        -o mediaflow-proxy-light \
-        "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_VERSION}/${BINARY_NAME}" && \
-    chmod +x mediaflow-proxy-light
 
 # ── Runtime stage ──────────────────────────────────────────────────────────
 # distroless/cc-debian12 provides glibc + libgcc (required by our Rust
@@ -44,7 +17,8 @@ FROM gcr.io/distroless/cc-debian12
 
 WORKDIR /app
 
-COPY --from=downloader /tmp/mediaflow-proxy-light /app/
+ARG TARGETARCH
+COPY --chmod=755 dist/${TARGETARCH}/mediaflow-proxy-light /app/
 COPY config-example.toml /app/config.toml
 
 ENV RUST_LOG=info
