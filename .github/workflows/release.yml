@@ -15,10 +15,10 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Desktop / server binaries (Linux, macOS, Windows)
+  # Linux server binaries (x86_64 + aarch64) — consumed by the Docker image
   # ---------------------------------------------------------------------------
   build-binaries:
-    name: Desktop · ${{ matrix.target }}
+    name: Linux · ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -36,18 +36,6 @@ jobs:
             target: aarch64-unknown-linux-gnu
             artifact_name: mediaflow-proxy-light
             asset_name: mediaflow-proxy-light-linux-aarch64
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact_name: mediaflow-proxy-light
-            asset_name: mediaflow-proxy-light-macos-x86_64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact_name: mediaflow-proxy-light
-            asset_name: mediaflow-proxy-light-macos-aarch64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact_name: mediaflow-proxy-light.exe
-            asset_name: mediaflow-proxy-light-windows-x86_64.exe
 
     steps:
       - uses: actions/checkout@v5
@@ -70,115 +58,6 @@ jobs:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
           file: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
           asset_name: ${{ matrix.asset_name }}
-          tag: ${{ github.ref }}
-          overwrite: true
-
-  # ---------------------------------------------------------------------------
-  # iOS — .xcframework containing static libs for device + simulator.
-  # Used by the companion iOS app which links the proxy as a Rust library via
-  # the C FFI (see `include/mediaflow_ffi.h`).
-  # ---------------------------------------------------------------------------
-  build-ios:
-    name: iOS · xcframework
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Rust + iOS targets
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
-
-      - name: Cache cargo build
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ios-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build xcframework
-        run: ./tools/build-ios.sh
-
-      - name: Archive xcframework
-        run: |
-          zip -r MediaflowProxy.xcframework.zip MediaflowProxy.xcframework
-
-      - name: Upload xcframework
-        uses: svenstaro/upload-release-action@v2
-        with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: MediaflowProxy.xcframework.zip
-          asset_name: mediaflow-proxy-light-ios.xcframework.zip
-          tag: ${{ github.ref }}
-          overwrite: true
-
-  # ---------------------------------------------------------------------------
-  # Android — native proxy binaries per ABI.
-  #
-  # This repo produces ONLY the stripped `libmediaflow-proxy.so` artifacts for
-  # each supported ABI.  The full APK (Kotlin UI + these binaries bundled in
-  # `jniLibs/`) is built by the companion `mediaflow-android` repo's own
-  # release workflow, which consumes these artifacts.
-  # ---------------------------------------------------------------------------
-  build-android:
-    name: Android · ${{ matrix.abi }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - abi: arm64-v8a
-            target: aarch64-linux-android
-          - abi: armeabi-v7a
-            target: armv7-linux-androideabi
-          - abi: x86_64
-            target: x86_64-linux-android
-          - abi: x86
-            target: i686-linux-android
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-          targets: ${{ matrix.target }}
-
-      - name: Set up Android NDK
-        id: ndk
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r26d
-
-      - name: Build for ${{ matrix.abi }}
-        env:
-          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
-          # Build only this one ABI to keep job parallelism from the matrix.
-          ABIS: ${{ matrix.abi }}
-          # Skip the auto-copy-into-sibling-Android-project step — no sibling
-          # checkout exists on the runner.
-          ANDROID_APP_DIR: ""
-        run: |
-          chmod +x tools/build-android.sh
-          ./tools/build-android.sh
-
-      - name: Package binary
-        run: |
-          OUT="mediaflow-proxy-light-android-${{ matrix.abi }}.tar.gz"
-          tar -czvf "$OUT" \
-            -C target/${{ matrix.target }}/release \
-            libmediaflow-proxy.so
-          echo "ASSET=$OUT" >> $GITHUB_ENV
-
-      - name: Upload to release
-        uses: svenstaro/upload-release-action@v2
-        with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: ${{ env.ASSET }}
-          asset_name: ${{ env.ASSET }}
           tag: ${{ github.ref }}
           overwrite: true
 
