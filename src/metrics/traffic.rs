@@ -138,7 +138,10 @@ mod tests {
                 .wrap(from_fn(traffic_meter))
                 .app_data(web::Data::new(Arc::clone(&metrics)))
                 .route("/proxy/stream", web::get().to(|| async { "0123456789" }))
-                .route("/proxy/hls/missing", web::get().to(HttpResponse::NotFound))
+                .route(
+                    "/proxy/stream/missing",
+                    web::get().to(HttpResponse::NotFound),
+                )
                 .route("/health", web::get().to(|| async { "OK" })),
         )
         .await;
@@ -151,7 +154,7 @@ mod tests {
         let body = test::call_and_read_body(&app, req).await;
         assert_eq!(body.len(), 10);
 
-        for uri in ["/health", "/proxy/hls/missing"] {
+        for uri in ["/health", "/proxy/stream/missing"] {
             let req = test::TestRequest::get()
                 .uri(uri)
                 .insert_header(("x-forwarded-for", "198.51.100.1"))

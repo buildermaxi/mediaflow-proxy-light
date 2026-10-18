@@ -43,14 +43,10 @@ jobs:
 
       - name: Run tests
         # --test-threads=1 because a few config tests mutate global env vars and
-        # race each other in parallel runs.
-        # Extractor tests are excluded here — they hit real upstream hosts
-        # (Cloudflare / Turnstile-protected) and are run locally only.
+        # race each other in parallel runs. All tests are offline.
         # Debug profile on purpose: the release profile (fat LTO, 1 codegen
-        # unit) made this step take ~12 min, and it reuses clippy's dep builds.
-        run: |
-          cargo test --lib --bins -- --test-threads=1
-          cargo test --test auth_tests --test config_tests -- --test-threads=1
+        # unit) is much slower to build, and this reuses clippy's dep builds.
+        run: cargo test -- --test-threads=1
 
       - name: Install cargo-machete
         uses: taiki-e/install-action@v2

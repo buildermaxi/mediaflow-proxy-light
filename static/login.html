@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="robots" content="noindex">
+    <title>Sign in · MediaFlow Proxy Light</title>
+    <script>
+        // Same theme key as the dashboard.
+        document.documentElement.classList.toggle('dark', localStorage.getItem('theme') === 'dark');
+    </script>
+    <style>
+        :root {
+            color-scheme: light;
+            --bg: #f4f4f2;
+            --surface: #fcfcfb;
+            --border: #e4e3df;
+            --text: #0b0b0b;
+            --text-2: #52514e;
+            --danger: #c62828;
+        }
+        html.dark {
+            color-scheme: dark;
+            --bg: #111110;
+            --surface: #1a1a19;
+            --border: #2e2e2c;
+            --text: #f0efec;
+            --text-2: #c3c2b7;
+            --danger: #ef6b6b;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            min-height: 100vh;
+            background: var(--bg);
+            color: var(--text);
+            font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+        }
+        main { max-width: 380px; margin: 0 auto; padding: 96px 20px; }
+        h1 { font-size: 22px; font-weight: 600; margin: 0 0 16px; }
+        .card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 18px; }
+        .label { font-size: 13px; color: var(--text-2); }
+        form { display: flex; gap: 8px; margin-top: 12px; }
+        input {
+            flex: 1; font: inherit; padding: 6px 10px; border-radius: 8px;
+            border: 1px solid var(--border); background: var(--bg); color: var(--text);
+        }
+        button {
+            font: inherit; cursor: pointer; border-radius: 8px;
+            border: 1px solid var(--border); background: var(--surface); color: var(--text);
+            padding: 6px 12px;
+        }
+        .error { color: var(--danger); font-size: 13px; margin-top: 10px; min-height: 1.45em; }
+    </style>
+</head>
+<body>
+<main>
+    <h1>Dashboard</h1>
+    <section class="card">
+        <div class="label">Enter the API password to view live stats.</div>
+        <form method="post" action="login">
+            <input name="password" type="password" autocomplete="current-password" placeholder="API password" required autofocus>
+            <button type="submit">Sign in</button>
+        </form>
+        <div class="error"><!--error--></div>
+    </section>
+</main>
+</body>
+</html>

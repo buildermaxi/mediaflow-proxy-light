@@ -6,62 +6,21 @@ edition = "2021"
 # Ignore dependencies that cargo-machete flags but are legitimately behind
 # disabled feature flags (detected when those features aren't in `default`).
 [package.metadata.cargo-machete]
-ignored = ["deadpool-redis", "redis", "openssl"]
-
-# Replace the `os_info` crate with a ~100-line stub in crates/os_info_stub/.
-# Upstream pulls in `objc2-ui-kit` + `objc2-foundation` on iOS — ~23 MB of
-# compiled UIKit bindings — purely to produce a system-info string that
-# grammers-client passes to Telegram's InitConnection.  We don't need
-# actual OS detection; a generic "iOS" / "64-bit" / "Unknown" is fine.
-#
-# Applies to ALL targets (stub is tiny, behaviour is benign everywhere).
-[patch.crates-io]
-os_info = { path = "crates/os_info_stub" }
+ignored = ["openssl"]
 
 # ---------------------------------------------------------------------------
 # Features
 # ---------------------------------------------------------------------------
 [features]
-# The default TLS backend is `tls-rustls` (pure-Rust).  We can't use
-# `tls-native` by default because:
-#   * `extractors` pulls in `rquest` → `boring-sys2` which statically
-#     links BoringSSL and exports SSL_* / BIO_* / ERR_* symbols.
-#   * `tls-native` pulls in `openssl-sys` which also needs those symbol
-#     names — resolving to BoringSSL's versions at link time, which lack
-#     OpenSSL-3-only symbols like `ERR_get_error_all`, `SSL_read_ex`,
-#     `SSL_get1_peer_certificate`, `SSL_CTX_ctrl` → link failure on Linux.
+# The server keeps only what AIOStreams needs — `/proxy/ip`, `/generate_urls`,
+# `/proxy/stream` — plus the dashboard, so the only build choice left is the
+# TLS backend for `reqwest`. Exactly one must be enabled.
 #
-# `tls-native` is still available as an opt-in (macOS works; Linux needs
-# `--no-default-features` and disabling `extractors`).  It avoids rustls
-# JA3/JA4 fingerprint blocks on a few Akamai-protected CDNs, but rquest
-# already handles the known fingerprint-sensitive hosts in our extractor
-# list, so rustls is the safe default for the rest of the proxy traffic.
-#
-# Exactly one of the two TLS backends must be enabled.
-default = [
-    "hls", "mpd", "drm", "xtream", "extractors", "web-ui",
-    "base64-url", "telegram", "acestream",
-    "tls-rustls",
-]
-hls = []
-mpd = []
-drm = []
-xtream = []
-extractors = []
-base64-url = []
-web-ui = ["dep:rust-embed", "dep:mime_guess"]
-redis = ["dep:deadpool-redis", "dep:redis"]
-telegram = ["dep:grammers-client", "dep:grammers-tl-types"]
-acestream = []
-transcode = []
-ffi = []    # iOS C FFI bridge (used when building xcframework)
-
-# TLS backends for `reqwest` (choose one — enabled via --features)
-# `rustls-tls-webpki-roots` bundles Mozilla's CA list into the binary instead
-# of probing the host filesystem (`rustls-tls-native-roots`).  Required for
-# Android/iOS where the system trust store isn't at standard Unix paths
-# (`/etc/ssl/*`) that `openssl-probe` scans → an empty root store → every
-# TLS handshake fails cert verification.
+# `tls-rustls` (default) bundles Mozilla's CA list into the binary instead of
+# probing the host filesystem, so the distroless image needs no CA bundle.
+# `tls-native` uses the OS TLS stack (OpenSSL on Linux), which avoids rustls
+# JA3/JA4 fingerprint blocks on a few Akamai-protected CDNs.
+default = ["tls-rustls"]
 tls-native = ["reqwest/native-tls"]
 tls-rustls = ["reqwest/rustls-tls-webpki-roots"]
 
@@ -72,17 +31,13 @@ vendored-openssl = ["openssl/vendored"]
 # ---------------------------------------------------------------------------
 # Lints
 # ---------------------------------------------------------------------------
-# Many configuration fields, cache-key helpers, header utilities, prebuffer
-# infrastructure, and extractor-base methods are deliberately exposed as
-# library APIs for the phased roadmap and for FFI consumers (Android / iOS).
-# Rustc flags them as dead code because the current binary doesn't call every
-# item yet — allowing crate-wide keeps warnings meaningful without losing
-# forward-compatible surface area.
+# A few configuration fields and helpers are library API that the binary
+# doesn't call — allowing dead code crate-wide keeps warnings meaningful.
 [lints.rust]
 dead_code = "allow"
 
-# MP4/DASH parsers and streaming handlers legitimately need many arguments in
-# a few places and we occasionally hold a RefCell borrow across an await when
+# URL building and streaming handlers legitimately need many arguments in a
+# few places and we occasionally hold a RefCell borrow across an await when
 # lock scope is fully controlled.  These pedantic lints are off crate-wide;
 # real correctness lints stay on.
 [lints.clippy]
@@ -108,32 +63,19 @@ debug = false
 actix-web = "4.13"
 actix-cors = "0.7"
 tokio = { version = "1.51", features = ["full"] }
-tokio-util = { version = "0.7", features = ["io"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 futures = "0.3"
-bytes = "1.11"
-async-stream = "0.3"
-async-trait = "0.1"
 
 # HTTP client — the TLS backend is selected by the `tls-native` /
-# `tls-rustls` feature flags (see [features] above).  `native-tls` uses the
-# OS TLS stack (SecureTransport on macOS, OpenSSL on Linux) and avoids
-# rustls JA3/JA4 fingerprint blocks on CDNs like Akamai — but it conflicts
-# with BoringSSL on Android, so mobile builds use `tls-rustls`.
+# `tls-rustls` feature flags (see [features] above).
 reqwest = { version = "0.12.28", default-features = false, features = ["stream", "json", "socks", "gzip", "deflate"] }
-# Browser TLS/JA3 impersonation — used by extractors that hit Cloudflare-protected
-# hosts (e.g. DoodStream → playmogo.com). rquest is a reqwest fork with Chrome
-# fingerprint spoofing, equivalent to Python's curl_cffi with impersonate="chrome".
-rquest = { version = "5", default-features = false, features = ["full", "socks"] }
-rquest-util = "2"
 
-# Crypto — AES-CBC for proxy-URL encryption, AES-CTR for CENC DRM, AES-GCM for F16Px
+# Crypto — AES-CBC for proxy-URL encryption, HMAC-SHA256 for the dashboard
+# session
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 cipher = { version = "0.4", features = ["block-padding"] }
-ctr = "0.9"
-aes-gcm = "0.10"
 hmac = "0.12"
 sha2 = "0.10"
 rand = "0.9.3"
@@ -141,7 +83,6 @@ base64 = "0.22.1"
 
 # Encoding / data
 hex = "0.4"
-uuid = { version = "1", features = ["v4"] }
 url = "2.5"
 urlencoding = "2.1"
 regex = "1.12"
@@ -157,46 +98,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Concurrency
 dashmap = "6"
 
-# Date / time — RFC3339 formatting for DASH availabilityStartTime / SegmentTimeline
-time = "0.3"
-
-# ---------------------------------------------------------------------------
-# Phase 1+ (HLS / MPD / Extractor) — always compiled but feature-gated at
-# call sites.  Add here when the corresponding src/ modules land.
-# ---------------------------------------------------------------------------
-
-# M3U8 parsing (Phase 1)
-m3u8-rs = "6"
-
-# XML parsing for DASH/MPD (Phase 2)
-quick-xml = { version = "0.37", features = ["serialize"] }
-
-# In-memory TTL cache (Phase 1)
-moka = { version = "0.12", features = ["future"] }
-
-# HTML scraping for extractors (Phase 5)
-scraper = "0.20"
-
-# ---------------------------------------------------------------------------
-# Optional / feature-gated dependencies
-# ---------------------------------------------------------------------------
-
-# Web UI — embed static/ at compile time
-rust-embed = { version = "8", optional = true }
-mime_guess = { version = "2", optional = true }
-
-# Redis — distributed cache & rate-limiting
-deadpool-redis = { version = "0.18", features = ["rt_tokio_1"], optional = true }
-redis = { version = "0.27", features = ["tokio-comp", "connection-manager"], optional = true }
-
-# Telegram MTProto
-grammers-client = { version = "0.7", optional = true }
-grammers-tl-types = { version = "0.7", optional = true }
-
-# Vendored OpenSSL (only needed for legacy builds; prefer rustls)
+# Vendored OpenSSL (only needed for `tls-native` builds; prefer rustls)
 openssl = { version = "0.10", features = ["vendored"], optional = true }
 
-# Process CPU time (all unix) and RSS (macOS / iOS) for the web dashboard.
+# Process CPU time (all unix) and RSS (macOS) for the web dashboard.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
@@ -204,7 +109,6 @@ libc = "0.2"
 # Dev dependencies
 # ---------------------------------------------------------------------------
 [dev-dependencies]
-tokio-test = "0.4"
 tempfile = "3.27"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
@@ -214,7 +118,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 [lib]
 name = "mediaflow_proxy_light"
 path = "src/lib.rs"
-crate-type = ["staticlib", "rlib"]   # staticlib needed for iOS xcframework
 
 [[bin]]
 name = "mediaflow-proxy-light"

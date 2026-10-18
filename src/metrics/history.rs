@@ -177,7 +177,7 @@ mod tests {
     fn checkpoint(
         at: Instant,
         minute: u64,
-        hls_bytes: u64,
+        direct_bytes: u64,
         responses: u64,
         failures: u64,
     ) -> Checkpoint {
@@ -186,7 +186,7 @@ mod tests {
             failures,
             ..Totals::default()
         };
-        totals.bytes_by_kind[StreamKind::Hls.index()] = hls_bytes;
+        totals.bytes_by_kind[StreamKind::Direct.index()] = direct_bytes;
         Checkpoint {
             at: at + Duration::from_secs(minute * 60),
             unix_secs: 1_800_000_000 + minute * 60,
@@ -206,7 +206,7 @@ mod tests {
 
         let view = history.view();
         assert_eq!(view.series.len(), 1);
-        assert_eq!(view.series[0].kind, StreamKind::Hls);
+        assert_eq!(view.series[0].kind, StreamKind::Direct);
         assert_eq!(view.series[0].bytes.iter().sum::<u64>(), 6_144_000);
         assert_eq!(view.secs.iter().sum::<u64>(), 120);
         assert_eq!(view.peaks.bytes_per_sec, 102_400);
