@@ -35,8 +35,8 @@ fn extract_token_from_url(url: &str) -> &str {
 fn encrypted_url_preserves_proxy_base_path() {
     let url = build_proxy_url(
         "https://proxy.example.test/custom/prefix/",
-        Some("/proxy/hls/manifest.m3u8"),
-        "https://origin.example.test/live/playlist.m3u8",
+        Some("/proxy/stream"),
+        "https://origin.example.test/files/movie.mkv",
         &default_headers(),
         &default_headers(),
         &default_headers(),
@@ -56,7 +56,7 @@ fn encrypted_url_preserves_proxy_base_path() {
         "encrypted URL must keep the complete proxy base path, got: {url}"
     );
     assert!(
-        url.ends_with("/proxy/hls/manifest.m3u8"),
+        url.ends_with("/proxy/stream"),
         "endpoint must follow token and preserved base path, got: {url}"
     );
 }
@@ -843,19 +843,18 @@ mod middleware_tests {
         assert!(wrong.decrypt(tok, None).is_err());
     }
 
-    /// Decrypted query_params (e.g. host=, redirect_stream=) must be injected
-    /// back into the request's query string so handlers can read them via
-    /// req.query_string() — mirrors Python proxy behaviour for /extractor/video.
+    /// Decrypted query_params must be injected back into the request's query
+    /// string so handlers can read them via req.query_string(), as in the
+    /// Python proxy.
     #[actix_web::test]
     async fn token_query_params_injected_into_query_string() {
         use mediaflow_proxy_light::auth::encryption::ProxyData;
 
         let h = EncryptionHandler::new(b"secret").unwrap();
         let mut extra = std::collections::HashMap::new();
-        extra.insert("host".to_string(), serde_json::json!("TestHost"));
-        extra.insert("redirect_stream".to_string(), serde_json::json!("true"));
+        extra.insert("extra".to_string(), serde_json::json!("kept"));
         let pd = ProxyData {
-            destination: "https://example.com/page.html".into(),
+            destination: "https://example.com/movie.mkv".into(),
             query_params: Some(serde_json::Value::Object(extra.into_iter().collect())),
             request_headers: None,
             response_headers: None,
@@ -871,19 +870,19 @@ mod middleware_tests {
         let app = test::init_service(
             App::new()
                 .wrap(AuthMiddleware::new("secret".into()))
-                .service(web::scope("/extractor").route("/video", web::get().to(echo_query))),
+                .service(web::scope("/proxy").route("/stream", web::get().to(echo_query))),
         )
         .await;
 
         let req = test::TestRequest::get()
-            .uri(&format!("/_token_{}/extractor/video", token))
+            .uri(&format!("/_token_{}/proxy/stream", token))
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 200);
         let body = String::from_utf8(test::read_body(resp).await.to_vec()).unwrap();
         assert!(
-            body.contains("host=TestHost"),
-            "host param must be in query string, got: {body}"
+            body.contains("extra=kept"),
+            "decrypted param must be in query string, got: {body}"
         );
         assert!(
             body.contains("d=https"),
@@ -930,76 +929,6 @@ mod middleware_tests {
         assert_eq!(
             body, "https://cdn.example.com/stream.m3u8",
             "ProxyData.destination must flow through to the handler"
-        );
-    }
-
-    /// Regression test for issue #20: GET /proxy/transcode returns 404.
-    ///
-    /// Verifies that both the exact path and trailing-slash variant reach the
-    /// handler when only the `""` route is registered in the scope (the current
-    /// main.rs pattern).  The trailing-slash variant was the failing case.
-    #[actix_web::test]
-    async fn transcode_scope_root_no_trailing_slash_is_reachable() {
-        let app = test::init_service(
-            App::new()
-                .wrap(AuthMiddleware::new("secret".into()))
-                .service(web::scope("/proxy/transcode").route(
-                    "",
-                    web::get().to(|| async { HttpResponse::Ok().body("hit") }),
-                ))
-                // Generic /proxy scope mirrors what main.rs registers after the specific scopes.
-                .service(web::scope("/proxy").route(
-                    "/stream",
-                    web::get().to(|| async { HttpResponse::Ok().body("stream") }),
-                )),
-        )
-        .await;
-
-        let req = test::TestRequest::get()
-            .uri("/proxy/transcode?d=http%3A%2F%2Fexample.com%2Fvid.ts&api_password=secret")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
-        assert_eq!(
-            resp.status(),
-            200,
-            "GET /proxy/transcode should be 200, not {}",
-            resp.status()
-        );
-    }
-
-    /// Issue #20 follow-up: GET /proxy/transcode/ (trailing slash) must also work.
-    #[actix_web::test]
-    async fn transcode_scope_root_trailing_slash_is_reachable() {
-        let app = test::init_service(
-            App::new()
-                .wrap(AuthMiddleware::new("secret".into()))
-                .service(
-                    web::scope("/proxy/transcode")
-                        .route(
-                            "",
-                            web::get().to(|| async { HttpResponse::Ok().body("hit") }),
-                        )
-                        .route(
-                            "/",
-                            web::get().to(|| async { HttpResponse::Ok().body("hit") }),
-                        ),
-                )
-                .service(web::scope("/proxy").route(
-                    "/stream",
-                    web::get().to(|| async { HttpResponse::Ok().body("stream") }),
-                )),
-        )
-        .await;
-
-        let req = test::TestRequest::get()
-            .uri("/proxy/transcode/?d=http%3A%2F%2Fexample.com%2Fvid.ts&api_password=secret")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
-        assert_eq!(
-            resp.status(),
-            200,
-            "GET /proxy/transcode/ (trailing slash) should be 200, not {}",
-            resp.status()
         );
     }
 }

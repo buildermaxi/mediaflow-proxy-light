@@ -4,9 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Dashboard · MediaFlow Proxy Light</title>
-    <link rel="icon" href="/logo.png">
+    <meta name="robots" content="noindex">
     <script>
-        // Apply the shared theme before first paint (same key as the other pages).
+        // Apply the shared theme before first paint (same key as the sign-in page).
         document.documentElement.classList.toggle('dark', localStorage.getItem('theme') === 'dark');
     </script>
     <style>
@@ -22,13 +22,7 @@
             --warning: #b45309;
             --success: #1a8f5a;
             /* One fixed color per stream type (validated categorical order). */
-            --k-hls: #2a78d6;
-            --k-dash: #eb6834;
             --k-direct: #1baf7a;
-            --k-xtream: #eda100;
-            --k-telegram: #e87ba4;
-            --k-acestream: #008300;
-            --k-transcode: #6250d6;
             --k-other: #a3a29c;
         }
         html.dark {
@@ -42,13 +36,7 @@
             --danger: #ef6b6b;
             --warning: #f0a33a;
             --success: #3fbf7f;
-            --k-hls: #3987e5;
-            --k-dash: #d95926;
             --k-direct: #199e70;
-            --k-xtream: #c98500;
-            --k-telegram: #d55181;
-            --k-acestream: #008300;
-            --k-transcode: #9085e9;
             --k-other: #6f6e69;
         }
         * { box-sizing: border-box; }
@@ -118,24 +106,11 @@
         td.none { color: var(--muted); text-align: center; padding: 14px 0; }
         .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
         .idle { color: var(--muted); }
-        .bar { display: inline-block; height: 6px; border-radius: 3px; background: var(--k-hls); vertical-align: 1px; margin-right: 6px; }
+        .bar { display: inline-block; height: 6px; border-radius: 3px; background: var(--k-direct); vertical-align: 1px; margin-right: 6px; }
         .warn { color: var(--warning); }
 
-        .chips { display: flex; flex-wrap: wrap; gap: 8px; }
-        .chip {
-            display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
-            padding: 5px 11px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface);
-        }
-        .chip .meta { color: var(--muted); }
         footer { font-size: 12px; color: var(--muted); }
-
-        #gate { max-width: 380px; margin: 60px auto; }
-        #gate form { display: flex; gap: 8px; margin-top: 12px; }
-        #gate input {
-            flex: 1; font: inherit; padding: 6px 10px; border-radius: 8px;
-            border: 1px solid var(--border); background: var(--bg); color: var(--text);
-        }
-        #gate .error { color: var(--danger); font-size: 13px; margin-top: 10px; min-height: 1.45em; }
+        header form { margin: 0; }
         [hidden] { display: none !important; }
     </style>
 </head>
@@ -145,19 +120,9 @@
         <h1>Dashboard</h1>
         <div class="status"><span id="dot" class="dot"></span><span id="status">connecting…</span></div>
         <div class="spacer"></div>
-        <a href="/">Home</a>
-        <button id="signOut" class="link" hidden>Sign out</button>
+        <form method="post" action="logout"><button type="submit" class="link">Sign out</button></form>
         <button id="themeToggle" aria-label="Toggle theme">◐</button>
     </header>
-
-    <section id="gate" class="card" hidden>
-        <div class="label">Enter the API password to view live stats.</div>
-        <form id="gateForm">
-            <input id="password" type="password" autocomplete="current-password" placeholder="API password" required>
-            <button type="submit">Unlock</button>
-        </form>
-        <div id="gateError" class="error"></div>
-    </section>
 
     <section id="stats" class="stack" hidden>
         <div class="kpis">
@@ -199,11 +164,6 @@
             </div>
         </div>
 
-        <div>
-            <h2>Services</h2>
-            <div class="chips" id="services"></div>
-        </div>
-
         <footer id="footer">Estimates · refreshed every 2 s</footer>
     </section>
 </main>
@@ -214,11 +174,7 @@
     const HISTORY_POLL_MS = 60000;
     const RATE_WINDOW_MS = 10000;   // live rates = average over the last ~10 s
     const LIVE_POINTS = 60;         // live chart: ~2 min
-    const PASSWORD_KEY = 'mediaflow_api_password';  // shared with the other tools
-    const KINDS = {
-        hls: 'HLS', dash: 'DASH', direct: 'Direct', xtream: 'Xtream',
-        telegram: 'Telegram', acestream: 'Acestream', transcode: 'Transcode', other: 'Other',
-    };
+    const KINDS = { direct: 'Direct', other: 'Other' };
     const KIND_ORDER = Object.keys(KINDS);
     const kindColor = (k) => `var(--k-${k})`;
 
@@ -309,10 +265,8 @@
         setTile('tileMemory', rss == null ? null : bytesParts(rss),
             rss == null ? 'not available on this platform' : `24 h peak ${fmtBytes(Math.max(peaks?.rss_bytes ?? 0, rss))}`);
 
-        const jobs = s.services.transcode?.jobs ?? 0;
         setTile('tileCpu', s.cpu == null ? null : [s.cpu.toFixed(s.cpu < 10 ? 1 : 0), '%'],
-            s.cpu_time_ms == null ? 'not available on this platform'
-                : `of ${plural(s.cpu_cores, 'core')}${jobs ? ` · ${plural(jobs, 'transcode')}` : ''}`);
+            s.cpu_time_ms == null ? 'not available on this platform' : `of ${plural(s.cpu_cores, 'core')}`);
 
         setTile('tileUsers', [String(s.active_clients), ''],
             `${plural(s.active_streams, 'stream')} · 24 h peak ${Math.max(peaks?.users ?? 0, s.active_clients)}`);
@@ -349,26 +303,6 @@
             <td class="num">${warn(h.failure_rate >= 0.02, `${(h.failure_rate * 100).toFixed(h.failure_rate && h.failure_rate < 0.1 ? 1 : 0)}%`)}</td>
             <td class="num">${warn(h.ttfb_p95_ms >= 1000, ttfb(h.ttfb_p95_ms))}</td></tr>`).join('')
             : '<tr><td class="none" colspan="4">No upstream requests yet</td></tr>';
-    }
-
-    function renderServices() {
-        const sv = current.services, chips = [];
-        const chip = (state, name, meta) => chips.push(
-            `<span class="chip"><span class="dot ${state}"></span>${esc(name)} <span class="meta">${esc(meta)}</span></span>`);
-        if (sv.hls_prebuffer) {
-            const { hits, misses } = sv.hls_prebuffer, total = hits + misses;
-            chip('ok', 'HLS prebuffer', total ? `${Math.round(hits / total * 100)}% hit rate` : 'no segments yet');
-        }
-        if (sv.telegram) {
-            const label = { connected: 'connected', not_connected: 'not connected', disabled: 'not configured' }[sv.telegram] ?? sv.telegram;
-            chip(sv.telegram === 'connected' ? 'ok' : sv.telegram === 'disabled' ? 'off' : 'warn', 'Telegram', label);
-        }
-        if (sv.acestream) chip(sv.acestream.streams ? 'ok' : 'off', 'Acestream', sv.acestream.streams ? plural(sv.acestream.streams, 'stream') : 'idle');
-        if (sv.transcode) {
-            const t = sv.transcode;
-            chip(t.enabled ? 'ok' : 'off', 'Transcode', t.enabled ? `${plural(t.jobs, 'job')} · ${t.encoder}` : 'disabled');
-        }
-        $('services').innerHTML = chips.join('') || '<span class="chip"><span class="meta">No optional services compiled in</span></span>';
     }
 
     // ── Stacked area chart ──────────────────────────────────────────────────
@@ -484,17 +418,15 @@
     }
 
     // ── Data loading ────────────────────────────────────────────────────────
-    class Locked extends Error {}
+    // The session cookie (HttpOnly) rides along with every same-origin fetch;
+    // the server checks it on each feed. Relative paths keep a reverse-proxy
+    // path prefix intact.
+    class SignedOut extends Error {}
 
     async function api(path) {
-        const password = localStorage.getItem(PASSWORD_KEY);
-        if (!password) throw new Locked('');
-        const res = await fetch(path, { headers: { Authorization: `Bearer ${password}` }, cache: 'no-store' });
-        if (res.status === 401) throw new Locked('Wrong API password.');
-        if (!res.ok) {
-            const body = await res.json().catch(() => ({}));
-            throw new Locked(body.error || `Server error (${res.status}).`);
-        }
+        const res = await fetch(path, { cache: 'no-store' });
+        if (res.status === 401) throw new SignedOut();
+        if (!res.ok) throw new Error(`Server error (${res.status})`);
         return res.json();
     }
 
@@ -503,33 +435,26 @@
         $('dot').className = `dot${ok ? ' ok' : ''}`;
     }
 
-    function showGate(message) {
-        clearTimeout(timer);
-        clearTimeout(historyTimer);
-        $('stats').hidden = true;
-        $('signOut').hidden = true;
-        $('gate').hidden = false;
-        $('gateError').textContent = message || '';
-        setStatus('locked', false);
-        $('password').focus();
-    }
+    // Session gone (signed out elsewhere, password changed): reload to get
+    // the sign-in page from the server.
+    const signedOut = () => location.reload();
+
+    // Earlier versions kept the raw API password in localStorage; drop it.
+    localStorage.removeItem('mediaflow_api_password');
 
     async function poll() {
         clearTimeout(timer);
         try {
-            const stats = await api('/dashboard/stats');
-            $('gate').hidden = true;
+            const stats = await api('dashboard/stats');
             $('stats').hidden = false;
-            $('signOut').hidden = false;
             ingest(stats);
             renderTiles();
             renderClients();
             renderHosts();
-            renderServices();
             if (mode === 'live') drawChart();
             setStatus('live', true);
         } catch (e) {
-            if (e instanceof Locked) return showGate(e.message);
+            if (e instanceof SignedOut) return signedOut();
             setStatus('offline — retrying', false);
         }
         if (!document.hidden) timer = setTimeout(poll, POLL_MS);
@@ -538,11 +463,11 @@
     async function pollHistory() {
         clearTimeout(historyTimer);
         try {
-            history = await api('/dashboard/history');
+            history = await api('dashboard/history');
             if (current) renderTiles();
             if (mode === '24h') drawChart();
         } catch (e) {
-            if (e instanceof Locked) return;  // poll() shows the gate
+            if (e instanceof SignedOut) return signedOut();
         }
         if (!document.hidden) historyTimer = setTimeout(pollHistory, HISTORY_POLL_MS);
     }
@@ -565,21 +490,9 @@
             clearTimeout(timer);
             clearTimeout(historyTimer);
             setStatus('paused', false);
-        } else if ($('gate').hidden) {
+        } else {
             start();
         }
-    });
-
-    $('gateForm').addEventListener('submit', (e) => {
-        e.preventDefault();
-        localStorage.setItem(PASSWORD_KEY, $('password').value.trim());
-        $('password').value = '';
-        start();
-    });
-
-    $('signOut').addEventListener('click', () => {
-        localStorage.removeItem(PASSWORD_KEY);
-        showGate();
     });
 
     $('themeToggle').addEventListener('click', () => {

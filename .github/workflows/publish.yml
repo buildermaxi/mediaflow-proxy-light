@@ -34,10 +34,7 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             arch: amd64
-          # Native ARM runner — avoids cross-compile entirely.  Cross-compiling
-          # boring-sys2 via gcc-aarch64-linux-gnu is unreliable (cc-rs / CMake /
-          # bindgen can silently fall back to host gcc, producing x86_64 .o files
-          # in the rlib → `Relocations in generic ELF (EM: 62)` at final link).
+          # Native ARM runner — avoids cross-compiling entirely.
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             arch: arm64

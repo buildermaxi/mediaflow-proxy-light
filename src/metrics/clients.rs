@@ -14,7 +14,7 @@ use serde::Serialize;
 use super::StreamKind;
 
 /// A client stays "active" this long (seconds) after its last stream closed.
-/// Covers the idle gap between HLS/DASH segment fetches.
+/// Covers the idle gap between a player's successive range requests.
 const IDLE_WINDOW_SECS: u64 = 60;
 
 /// Rows returned to the dashboard; the estimate itself counts every client.
@@ -221,8 +221,8 @@ mod tests {
             "198.51.100.1".parse().unwrap(),
         );
 
-        table.open(a, StreamKind::Hls, "Kodi", 1_000);
-        table.open(a, StreamKind::Hls, UNKNOWN_PLAYER, 1_000);
+        table.open(a, StreamKind::Direct, "Kodi", 1_000);
+        table.open(a, StreamKind::Direct, UNKNOWN_PLAYER, 1_000);
         let bytes_b = table.open(b, StreamKind::Direct, "VLC", 1_000);
         bytes_b.fetch_add(500, Ordering::Relaxed);
         table.close(a, 1_010);

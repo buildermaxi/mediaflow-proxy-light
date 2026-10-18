@@ -1,10 +1,9 @@
 # ---------------------------------------------------------------------------
 # Multi-stage Dockerfile — builds from source.
 #
-# Multi-arch (linux/amd64 + linux/arm64) is handled by Docker buildx.  Under
-# QEMU the arm64 build is slower, but this lets the Docker job run in
-# parallel with the desktop/mobile binary builds in CI without any
-# cross-job artifact choreography.
+# Multi-arch (linux/amd64 + linux/arm64) is handled by Docker buildx (slower
+# under QEMU for arm64). CI publishes from prebuilt binaries instead, see
+# Dockerfile.prebuilt.
 #
 # TLS backend: `tls-rustls` (the crate default) → no system OpenSSL needed.
 # ---------------------------------------------------------------------------
@@ -13,48 +12,23 @@ FROM rust:1.95-slim-bookworm AS builder
 
 WORKDIR /usr/src/app
 
-# Build deps. Beyond pkg-config + build-essential, the `extractors` feature
-# pulls in `rquest` → `boring-sys2` which statically compiles BoringSSL:
-#   * cmake / ninja / perl / python3 / golang-go — BoringSSL build system
-#   * git                                         — boring-sys2 invokes
-#                                                   `git init` + `git apply`
-#                                                   to apply bundled patches
-#   * clang + libclang-dev                        — bindgen needs libclang.so
-#     to generate BoringSSL FFI bindings
-#
-# The CI release workflow builds on native runners (see .github/workflows/
-# release.yml) that already ship all of the above, which is why this
-# Dockerfile has historically gotten away with a shorter list. A plain
-# `docker build .` without these panics inside the boring-sys2 build script.
+# Build deps: a C toolchain for `ring` (rustls' crypto backend).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        pkg-config \
         build-essential \
-        cmake \
-        ninja-build \
-        perl \
-        python3 \
-        golang-go \
-        git \
-        clang \
-        libclang-dev \
         && rm -rf /var/lib/apt/lists/*
 
-# Dependency-only prebuild for layer caching. `crates/` is needed because
-# Cargo.toml has `[patch.crates-io] os_info = { path = "crates/os_info_stub" }`
-# — without it, cargo fails to resolve the workspace patch entry.
+# Dependency-only prebuild for layer caching.
 COPY Cargo.toml Cargo.lock ./
-COPY crates ./crates
 RUN mkdir src && \
     echo "fn main() {}" > src/main.rs && \
     echo "pub fn add(l: usize, r: usize) -> usize { l + r }" > src/lib.rs && \
     cargo build --release && \
     rm -rf src target/release/deps/mediaflow*
 
-# Real build. `static/` is embedded into the binary by rust-embed when the
-# `web-ui` feature is enabled (default), so it must be present at compile
-# time even though nothing references it at runtime.
+# Real build. The dashboard pages in `static/` are embedded into the binary
+# with `include_str!`, so they must be present at compile time even though
+# nothing reads them at runtime.
 COPY src    ./src
-COPY tools  ./tools
 COPY static ./static
 RUN cargo build --release
 

@@ -11,8 +11,7 @@
 
 # ── Runtime stage ──────────────────────────────────────────────────────────
 # distroless/cc-debian12 provides glibc + libgcc (required by our Rust
-# binary, which links libstdc++ via rquest's boring-sys).  No shell, no
-# package manager — ~20 MB total.
+# binary).  No shell, no package manager — ~20 MB total.
 FROM gcr.io/distroless/cc-debian12
 
 WORKDIR /app

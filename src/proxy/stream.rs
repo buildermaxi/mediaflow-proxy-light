@@ -17,8 +17,6 @@ use crate::{
 
 #[derive(Clone)]
 pub struct StreamManager {
-    /// Fallback shared client (used if per-thread lookup fails).
-    shared_client: Client,
     /// Per-thread clients — each actix-web worker thread gets its own reqwest
     /// Client and connection pool.  This eliminates pool contention at high
     /// concurrency: c=50 across 8 workers becomes c≈6 per pool instead of
@@ -42,10 +40,8 @@ pub struct StreamManager {
 impl StreamManager {
     pub fn new(config: ProxyConfig) -> Self {
         let proxy_router = ProxyRouter::from_config(&config);
-        let shared_client = Self::create_default_client(&config, &proxy_router);
 
         Self {
-            shared_client,
             per_thread_clients: Arc::new(DashMap::new()),
             route_clients: Arc::new(DashMap::new()),
             per_host_semaphores: Arc::new(DashMap::new()),
@@ -306,103 +302,6 @@ impl StreamManager {
         Ok((response, tally))
     }
 
-    /// Forward an arbitrary HTTP request (any method + body) to `url` and return the full response.
-    ///
-    /// Unlike `make_request_raw` (GET-only, errors on 4xx/5xx), this method passes through any
-    /// status code verbatim so the caller can relay it back to the client.
-    pub async fn forward_request(
-        &self,
-        method: reqwest::Method,
-        url: String,
-        headers: reqwest::header::HeaderMap,
-        body: bytes::Bytes,
-    ) -> AppResult<Response> {
-        let proxy_config = self.proxy_router.get_proxy_config(&url);
-        let client = if let Some(route_config) = proxy_config {
-            let cache_key = format!(
-                "{}|{}|{}",
-                route_config.proxy,
-                route_config.proxy_url.as_deref().unwrap_or(""),
-                route_config.verify_ssl,
-            );
-            if let Some(cached) = self.route_clients.get(&cache_key) {
-                cached.clone()
-            } else {
-                let new_client = Self::build_route_client(&self.config, &route_config)?;
-                self.route_clients.insert(cache_key, new_client.clone());
-                new_client
-            }
-        } else {
-            self.thread_client()
-        };
-
-        let header_timeout =
-            Duration::from_secs(self.config.connect_timeout * self.config.request_timeout_factor);
-
-        let mut req = client.request(method, &url).headers(headers);
-        if !body.is_empty() {
-            req = req.body(body);
-        }
-
-        let started = Instant::now();
-        let sent = timeout(header_timeout, req.send()).await;
-        self.record_upstream(&url, started, &sent);
-        let response = sent
-            .map_err(|_| {
-                AppError::Proxy(format!(
-                    "Request timed out after {} s waiting for response headers from {url}",
-                    header_timeout.as_secs()
-                ))
-            })?
-            .map_err(|e| AppError::Proxy(format!("Failed to connect to upstream: {}", e)))?;
-
-        Ok(response)
-    }
-
-    /// Fetch all response bytes into memory (for small resources like M3U8 playlists / MPD manifests).
-    ///
-    /// A separate read timeout (`config.body_read_timeout`, default 60s) is
-    /// applied to `.bytes()` so CDN throttling (e.g. Akamai drip-feeding a
-    /// large MPD) doesn't hang the handler indefinitely.  The connection-
-    /// level timeout in `make_request` only covers the TCP + TLS + response-
-    /// headers phase; body reading has no built-in limit.
-    pub async fn fetch_bytes(
-        &self,
-        url: String,
-        headers: reqwest::header::HeaderMap,
-    ) -> AppResult<bytes::Bytes> {
-        self.fetch_bytes_with_final_url(url, headers)
-            .await
-            .map(|(bytes, _)| bytes)
-    }
-
-    /// Fetch all response bytes into memory and also return the effective
-    /// response URL after reqwest has followed redirects.
-    pub async fn fetch_bytes_with_final_url(
-        &self,
-        url: String,
-        headers: reqwest::header::HeaderMap,
-    ) -> AppResult<(bytes::Bytes, String)> {
-        let body_timeout = Duration::from_secs(self.config.body_read_timeout);
-        let (response, tally) = {
-            let _permit = self.acquire_host_permit(&url).await?;
-            self.make_request_raw(url, headers).await?
-        };
-        let final_url = response.url().to_string();
-        let bytes = timeout(body_timeout, response.bytes())
-            .await
-            .map_err(|_| {
-                AppError::Proxy(format!(
-                    "Body read timeout after {} s",
-                    self.config.body_read_timeout
-                ))
-            })?
-            .map_err(|e| AppError::Proxy(format!("Failed to read response body: {}", e)))?;
-        tally.add(bytes.len());
-
-        Ok((bytes, final_url))
-    }
-
     pub async fn create_stream(
         &self,
         url: String,
@@ -446,21 +345,6 @@ impl StreamManager {
             result.map_err(|e| AppError::Proxy(format!("Stream error: {}", e)))
         });
         Ok((status, response_headers, Some(stream)))
-    }
-
-    /// Resolve the proxy URL (if any) that should be used for the given destination URL.
-    ///
-    /// Uses the already-built `ProxyRouter` stored in `self` — zero regex compilation
-    /// or allocation on the hot path.  Returns `None` when no proxy applies.
-    pub fn get_proxy_url_for(&self, url: &str) -> Option<String> {
-        self.proxy_router
-            .get_proxy_config(url)
-            .filter(|pc| pc.proxy)
-            .and_then(|pc| {
-                pc.proxy_url
-                    .clone()
-                    .or_else(|| self.config.proxy_url.clone())
-            })
     }
 
     /// Wrap a stream so that errors are logged with the byte offset.
