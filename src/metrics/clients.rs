@@ -1,7 +1,6 @@
 //! Per-client activity: the "active users" estimate and the clients table.
 //!
-//! Keyed by client IP, but addresses never leave this module in full: views
-//! only carry the IPv4 /24 or IPv6 /48 prefix.
+//! Keyed by client IP; each client shows the file it last opened.
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -10,8 +9,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use serde::Serialize;
-
-use super::StreamKind;
 
 /// A client stays "active" this long (seconds) after its last stream closed.
 /// Covers the idle gap between a player's successive range requests.
@@ -59,20 +56,6 @@ pub fn player_from_user_agent(user_agent: &str) -> &'static str {
         .map_or(UNKNOWN_PLAYER, |(_, name)| name)
 }
 
-/// Keep the network prefix only: IPv4 /24, IPv6 /48.
-pub fn mask_ip(ip: IpAddr) -> String {
-    match ip.to_canonical() {
-        IpAddr::V4(v4) => {
-            let [a, b, c, _] = v4.octets();
-            format!("{a}.{b}.{c}.x")
-        }
-        IpAddr::V6(v6) => {
-            let [a, b, c, ..] = v6.segments();
-            format!("{a:x}:{b:x}:{c:x}::x")
-        }
-    }
-}
-
 #[derive(Debug, Default)]
 pub(super) struct ClientTable {
     by_ip: HashMap<IpAddr, ClientActivity>,
@@ -86,8 +69,9 @@ struct ClientActivity {
     open_streams: u32,
     first_seen: u64,
     last_seen: u64,
-    kind: StreamKind,
     player: &'static str,
+    /// File name of the last stream opened, as sent (percent-encoded).
+    title: Option<Box<str>>,
     /// Bytes served to this client; bumped lock-free by its open streams.
     bytes: Arc<AtomicU64>,
 }
@@ -99,7 +83,7 @@ pub struct ClientView {
     pub id: u32,
     pub ip: String,
     pub player: &'static str,
-    pub kind: StreamKind,
+    pub title: Option<String>,
     pub streaming: bool,
     pub bytes: u64,
     pub since_secs: u64,
@@ -109,8 +93,8 @@ impl ClientTable {
     pub(super) fn open(
         &mut self,
         ip: IpAddr,
-        kind: StreamKind,
         player: &'static str,
+        title: Option<&str>,
         now: u64,
     ) -> Arc<AtomicU64> {
         if now.saturating_sub(self.last_prune) >= IDLE_WINDOW_SECS {
@@ -124,16 +108,20 @@ impl ClientTable {
                 open_streams: 0,
                 first_seen: now,
                 last_seen: now,
-                kind,
                 player,
+                title: None,
                 bytes: Arc::default(),
             }
         });
         client.open_streams += 1;
         client.last_seen = now;
-        client.kind = kind;
         if player != UNKNOWN_PLAYER {
             client.player = player;
+        }
+        // A player's successive range requests repeat the same name: only
+        // allocate when it changes.
+        if let Some(title) = title.filter(|t| client.title.as_deref() != Some(*t)) {
+            client.title = Some(title.into());
         }
         Arc::clone(&client.bytes)
     }
@@ -157,9 +145,11 @@ impl ClientTable {
             .iter()
             .map(|(ip, c)| ClientView {
                 id: c.id,
-                ip: mask_ip(*ip),
+                ip: ip.to_string(),
                 player: c.player,
-                kind: c.kind,
+                title: c.title.as_deref().map(|t| {
+                    urlencoding::decode(t).map_or_else(|_| t.to_owned(), |d| d.into_owned())
+                }),
                 streaming: c.open_streams > 0,
                 bytes: c.bytes.load(Ordering::Relaxed),
                 since_secs: now.saturating_sub(c.first_seen),
@@ -181,19 +171,6 @@ impl ClientTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn masks_ips_to_network_prefix() {
-        assert_eq!(mask_ip("203.0.113.42".parse().unwrap()), "203.0.113.x");
-        assert_eq!(
-            mask_ip("2001:db8:abcd:12::1".parse().unwrap()),
-            "2001:db8:abcd::x"
-        );
-        assert_eq!(
-            mask_ip("::ffff:198.51.100.7".parse().unwrap()),
-            "198.51.100.x"
-        );
-    }
 
     #[test]
     fn classifies_players_case_insensitively() {
@@ -221,9 +198,9 @@ mod tests {
             "198.51.100.1".parse().unwrap(),
         );
 
-        table.open(a, StreamKind::Direct, "Kodi", 1_000);
-        table.open(a, StreamKind::Direct, UNKNOWN_PLAYER, 1_000);
-        let bytes_b = table.open(b, StreamKind::Direct, "VLC", 1_000);
+        table.open(a, "Kodi", Some("First.Movie.mkv"), 1_000);
+        table.open(a, UNKNOWN_PLAYER, Some("Second%20Movie.2160p.mkv"), 1_000);
+        let bytes_b = table.open(b, "VLC", None, 1_000);
         bytes_b.fetch_add(500, Ordering::Relaxed);
         table.close(a, 1_010);
         table.close(a, 1_010);
@@ -232,11 +209,36 @@ mod tests {
         let rows = table.snapshot(1_030);
         assert_eq!(
             (rows[0].ip.as_str(), rows[0].bytes, rows[0].streaming),
-            ("198.51.100.x", 500, true)
+            ("198.51.100.1", 500, true)
         );
-        assert_eq!((rows[1].player, rows[1].streaming), ("Kodi", false));
+        assert_eq!(rows[0].title, None);
+        assert_eq!(
+            (rows[1].player, rows[1].title.as_deref(), rows[1].streaming),
+            ("Kodi", Some("Second Movie.2160p.mkv"), false)
+        );
 
         // `a` idled out; `b` still has an open stream.
         assert_eq!(table.active_count(1_010 + IDLE_WINDOW_SECS), 1);
+    }
+
+    #[test]
+    fn keeps_the_last_named_file() {
+        let mut table = ClientTable::default();
+        let ip: IpAddr = "203.0.113.1".parse().unwrap();
+
+        table.open(ip, "Stremio", Some("Movie%20One.mkv"), 1_000);
+        // `/proxy/ip`, or a stream URL without a name, keeps the last one.
+        table.open(ip, "Stremio", None, 1_001);
+        assert_eq!(
+            table.snapshot(1_002)[0].title.as_deref(),
+            Some("Movie One.mkv")
+        );
+
+        // Not UTF-8 once decoded: shown as sent.
+        table.open(ip, "Stremio", Some("bad%FF.mkv"), 1_003);
+        assert_eq!(
+            table.snapshot(1_004)[0].title.as_deref(),
+            Some("bad%FF.mkv")
+        );
     }
 }
