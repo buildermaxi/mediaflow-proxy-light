@@ -125,17 +125,19 @@ impl AppMetrics {
         }
     }
 
-    /// Register a response body starting to stream to `client`, returning
-    /// that client's byte counter. Must be paired with [`AppMetrics::stream_closed`].
+    /// Register a response body starting to stream `title` to `client`,
+    /// returning that client's byte counter. Must be paired with
+    /// [`AppMetrics::stream_closed`].
     pub fn stream_opened(
         &self,
         client: IpAddr,
         kind: StreamKind,
         player: &'static str,
+        title: Option<&str>,
     ) -> Arc<AtomicU64> {
         self.active_connections.fetch_add(1, Ordering::Relaxed);
         self.open_by_kind[kind.index()].fetch_add(1, Ordering::Relaxed);
-        locked(&self.clients).open(client, kind, player, unix_now())
+        locked(&self.clients).open(client, player, title, unix_now())
     }
 
     pub fn stream_closed(&self, client: IpAddr, kind: StreamKind) {
@@ -157,7 +159,7 @@ impl AppMetrics {
         locked(&self.clients).active_count(unix_now())
     }
 
-    /// Active clients with masked IPs, busiest first.
+    /// Active clients, busiest first.
     pub fn clients(&self) -> Vec<ClientView> {
         locked(&self.clients).snapshot(unix_now())
     }

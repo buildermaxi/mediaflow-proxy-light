@@ -96,7 +96,6 @@
         .tip .when { color: var(--muted); margin-bottom: 4px; }
         .tip .total { margin-top: 4px; font-weight: 600; }
 
-        .two { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 14px; }
         .scroll { overflow-x: auto; }
         table { width: 100%; border-collapse: collapse; font-size: 12px; }
         th { text-align: left; font-weight: 500; color: var(--muted); padding: 0 10px 6px 0; }
@@ -104,6 +103,8 @@
         th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; padding: 0 0 6px 10px; }
         td.num { padding: 6px 0 6px 10px; }
         td.none { color: var(--muted); text-align: center; padding: 14px 0; }
+        /* Release names have no spaces: wrap after dots and underscores (<wbr>), else anywhere, rather than overflow. */
+        td.title { white-space: normal; overflow-wrap: anywhere; }
         .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
         .idle { color: var(--muted); }
         .bar { display: inline-block; height: 6px; border-radius: 3px; background: var(--k-direct); vertical-align: 1px; margin-right: 6px; }
@@ -147,21 +148,19 @@
             </div>
         </div>
 
-        <div class="two">
-            <div class="card scroll">
-                <h2>Users <span class="note">IPs masked</span></h2>
-                <table>
-                    <thead><tr><th>Client</th><th>Player</th><th>Watching</th><th class="num">Rate</th><th class="num">Since</th></tr></thead>
-                    <tbody id="clients"></tbody>
-                </table>
-            </div>
-            <div class="card scroll">
-                <h2>Upstream hosts <span class="note">last ~10 min</span></h2>
-                <table>
-                    <thead><tr><th>Host</th><th>Traffic</th><th class="num">Failed</th><th class="num">TTFB p95</th></tr></thead>
-                    <tbody id="hosts"></tbody>
-                </table>
-            </div>
+        <div class="card scroll">
+            <h2>Users</h2>
+            <table>
+                <thead><tr><th>Client</th><th>Player</th><th>Title</th><th class="num">Rate</th><th class="num">Since</th></tr></thead>
+                <tbody id="clients"></tbody>
+            </table>
+        </div>
+        <div class="card scroll">
+            <h2>Upstream hosts <span class="note">last ~10 min</span></h2>
+            <table>
+                <thead><tr><th>Host</th><th>Traffic</th><th class="num">Failed</th><th class="num">TTFB p95</th></tr></thead>
+                <tbody id="hosts"></tbody>
+            </table>
         </div>
 
         <footer id="footer">Estimates · refreshed every 2 s</footer>
@@ -287,7 +286,7 @@
         $('clients').innerHTML = rows.length ? rows.map((c) => `<tr>
             <td class="mono">${esc(c.ip)}</td>
             <td>${esc(c.player)}</td>
-            <td${c.streaming ? '' : ' class="idle" title="Between requests"'}>${esc(KINDS[c.kind] ?? c.kind)}</td>
+            <td class="title${c.streaming ? '"' : ' idle" title="Between requests"'}>${c.title == null ? '—' : esc(c.title).replace(/[._]/g, '$&<wbr>')}</td>
             <td class="num">${c.rate == null ? '—' : fmtBits(c.rate)}</td>
             <td class="num">${fmtDuration(c.since_secs)}</td></tr>`).join('')
             : '<tr><td class="none" colspan="5">No active users</td></tr>';

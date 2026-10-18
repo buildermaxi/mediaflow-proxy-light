@@ -22,6 +22,11 @@ use actix_web::{
 
 use super::{clients::player_from_user_agent, AppMetrics, StreamKind};
 
+/// Longest file name kept per client, in (percent-encoded) bytes: real
+/// release names stay well under it, but a crafted URL can't park a ~128 KB
+/// string on every client.
+const MAX_TITLE_LEN: usize = 1024;
+
 pub async fn traffic_meter(
     req: ServiceRequest,
     next: Next<impl MessageBody + 'static>,
@@ -47,11 +52,27 @@ pub async fn traffic_meter(
     metrics.record_media_response(status);
 
     match (res?, client) {
-        (res, Some((ip, player))) if status.is_success() => Ok(res
-            .map_body(|_, body| MeteredBody::new(body, metrics, kind, ip, player))
-            .map_into_right_body()),
+        (res, Some((ip, player))) if status.is_success() => {
+            // `req` was moved into `next`: read the path off the response's
+            // request, the same one, already rewritten by the outer auth
+            // middleware (no `/_token_…` prefix).
+            let title = stream_title(res.request().path());
+            let client_bytes = metrics.stream_opened(ip, kind, player, title);
+            Ok(res
+                .map_body(|_, body| MeteredBody::new(body, metrics, kind, ip, client_bytes))
+                .map_into_right_body())
+        }
         (res, _) => Ok(res.map_into_left_body()),
     }
+}
+
+/// The `/proxy/stream/<filename>` segment, still percent-encoded, cut to
+/// [`MAX_TITLE_LEN`].
+fn stream_title(path: &str) -> Option<&str> {
+    let name = path
+        .strip_prefix("/proxy/stream/")
+        .filter(|name| !name.is_empty())?;
+    Some(&name[..name.floor_char_boundary(MAX_TITLE_LEN)])
 }
 
 /// Client address, honouring `Forwarded` / `X-Forwarded-For` so users behind
@@ -69,7 +90,8 @@ fn client_ip(req: &ServiceRequest) -> Option<IpAddr> {
 }
 
 /// Response body that counts bytes as actix sends them, and keeps the stream
-/// registered as open until actix drops it (fully sent or client gone).
+/// registered by [`AppMetrics::stream_opened`] open until actix drops it
+/// (fully sent or client gone).
 pub struct MeteredBody {
     inner: BoxBody,
     metrics: Arc<AppMetrics>,
@@ -84,9 +106,8 @@ impl MeteredBody {
         metrics: Arc<AppMetrics>,
         kind: StreamKind,
         client: IpAddr,
-        player: &'static str,
+        client_bytes: Arc<AtomicU64>,
     ) -> Self {
-        let client_bytes = metrics.stream_opened(client, kind, player);
         Self {
             inner: BoxBody::new(body),
             metrics,
@@ -128,6 +149,8 @@ impl MessageBody for MeteredBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::encryption::{EncryptionHandler, ProxyData};
+    use crate::auth::middleware::AuthMiddleware;
     use actix_web::{middleware::from_fn, test, App, HttpResponse};
 
     #[actix_web::test]
@@ -172,7 +195,69 @@ mod tests {
         assert_eq!(clients.len(), 1);
         assert_eq!(
             (clients[0].ip.as_str(), clients[0].player, clients[0].bytes),
-            ("203.0.113.x", "TiviMate", 10)
+            ("203.0.113.7", "TiviMate", 10)
         );
+        assert_eq!(clients[0].title, None);
+    }
+
+    #[actix_web::test]
+    async fn names_streams_after_the_requested_file() {
+        const PASSWORD: &str = "s3cret";
+        let metrics = AppMetrics::new();
+        // Same order as main.rs: auth outside the meter, so the meter sees
+        // the path with the `/_token_…` prefix already stripped.
+        let app = test::init_service(
+            App::new()
+                .wrap(from_fn(traffic_meter))
+                .wrap(AuthMiddleware::new(PASSWORD.to_string()))
+                .app_data(web::Data::new(Arc::clone(&metrics)))
+                .route(
+                    "/proxy/stream/{filename:.*}",
+                    web::get().to(|| async { "0123456789" }),
+                ),
+        )
+        .await;
+        let token = EncryptionHandler::new(PASSWORD.as_bytes())
+            .unwrap()
+            .encrypt(&ProxyData {
+                destination: "https://example.com/dl/abc".into(),
+                query_params: None,
+                request_headers: None,
+                response_headers: None,
+                exp: None,
+                ip: None,
+            })
+            .unwrap();
+
+        let req = test::TestRequest::get()
+            .uri(&format!(
+                "/_token_{token}/proxy/stream/Some%20Movie.2026.MULTI.2160p.WEB.H265-GRP"
+            ))
+            .insert_header(("x-forwarded-for", "2001:db8:abcd:12::1"))
+            .to_request();
+        assert_eq!(test::call_and_read_body(&app, req).await.len(), 10);
+
+        let clients = metrics.clients();
+        assert_eq!(
+            (clients[0].ip.as_str(), clients[0].title.as_deref()),
+            (
+                "2001:db8:abcd:12::1",
+                Some("Some Movie.2026.MULTI.2160p.WEB.H265-GRP")
+            )
+        );
+        assert_eq!(metrics.active_connections.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.open_streams(StreamKind::Direct), 0);
+    }
+
+    #[actix_web::test]
+    async fn takes_titles_from_stream_paths_only() {
+        assert_eq!(stream_title("/proxy/stream/Movie.mkv"), Some("Movie.mkv"));
+        for path in ["/proxy/stream/", "/proxy/stream", "/proxy/ip"] {
+            assert_eq!(stream_title(path), None, "{path}");
+        }
+
+        // `a` then 2-byte `é`s: byte 1024 falls mid-character, so the cut steps back.
+        let long = format!("/proxy/stream/a{}", "é".repeat(MAX_TITLE_LEN));
+        assert_eq!(stream_title(&long).unwrap().len(), MAX_TITLE_LEN - 1);
     }
 }
