@@ -1,6 +1,7 @@
 name: Publish
 
-# Every merge to main publishes a fresh multi-arch image to ghcr.
+# Every merge to main publishes a fresh multi-arch image to ghcr, and the same
+# Linux binaries as a GitHub release (for native installs, see deploy/).
 on:
   push:
     branches: [ main ]
@@ -57,6 +58,19 @@ jobs:
         # Default features include `tls-rustls` (pure-Rust TLS), so no system
         # OpenSSL is needed.  Each matrix entry runs on a native host.
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Check glibc compatibility
+        # The runner's glibc is newer than Debian 12's, so a dependency could
+        # start requiring symbols that the distroless image (cc-debian12) and
+        # Raspberry Pi OS Bookworm lack. Fail here rather than ship a binary
+        # that won't start. Keep MAX_GLIBC in sync with deploy/install.sh.
+        env:
+          MAX_GLIBC: "2.36"
+        run: |
+          bin=target/${{ matrix.target }}/release/mediaflow-proxy-light
+          needed=$(readelf -V --wide "$bin" | grep -o 'GLIBC_[0-9][0-9.]*' | cut -d_ -f2 | sort -uV | tail -n1)
+          echo "Highest glibc symbol version needed: $needed (max allowed: $MAX_GLIBC)"
+          printf '%s\n' "$needed" "$MAX_GLIBC" | sort -V -C
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
@@ -122,3 +136,47 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # ---------------------------------------------------------------------------
+  # GitHub release with the same binaries, for native installs (systemd).
+  # One release per merge, tagged v<Cargo version>-<short sha>; the newest is
+  # "latest", which deploy/install.sh downloads from.
+  # ---------------------------------------------------------------------------
+  release:
+    name: GitHub release
+    runs-on: ubuntu-latest
+    needs: build-binaries
+    # A manual run from another branch must not publish a release.
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: dist
+
+      - name: Prepare assets
+        run: |
+          mkdir release
+          for arch in amd64 arm64; do
+            cp "dist/bin-$arch/mediaflow-proxy-light" "release/mediaflow-proxy-light-linux-$arch"
+          done
+          cp deploy/install.sh deploy/mediaflow-proxy-light.service release/
+          cd release && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          tag="v${version}-${GITHUB_SHA::7}"
+          gh release create "$tag" release/* \
+            --target "$GITHUB_SHA" \
+            --title "$tag" \
+            --generate-notes \
+            --latest

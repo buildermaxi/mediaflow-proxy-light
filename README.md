@@ -45,6 +45,31 @@ docker run -d \
 In AIOStreams, set the proxy to **MediaFlow Proxy** with this server's URL and the same
 password.
 
+## Run natively (Raspberry Pi, any Linux)
+
+Every merge to `main` also publishes the Linux binaries (x86_64 and arm64) as a GitHub
+release. On a 64-bit Linux with systemd and glibc 2.36+ (Debian 12, Raspberry Pi OS
+Bookworm, Ubuntu 22.10 or newer), this installs the latest one as a sandboxed systemd
+service, listening on port 8888:
+
+```bash
+curl -fsSL https://github.com/buildermaxi/mediaflow-proxy-light/releases/latest/download/install.sh | sudo bash
+```
+
+A random API password is generated and printed on first install; pass
+`MEDIAFLOW_API_PASSWORD=…` after `sudo` to choose it instead. On a Raspberry Pi the OS
+must be the **64-bit** Raspberry Pi OS: check that `dpkg --print-architecture` prints
+`arm64`.
+
+- **Configuration:** `/etc/mediaflow-proxy-light/env` (the `APP__*` variables below), then
+  `sudo systemctl restart mediaflow-proxy-light`
+- **Logs:** `journalctl -u mediaflow-proxy-light -f`
+- **Update:** run the same command again; it only restarts the service when the binary
+  changed. Set `MEDIAFLOW_VERSION=<release tag>` after `sudo` to install a given release.
+- **Uninstall:** `sudo systemctl disable --now mediaflow-proxy-light && sudo rm -r
+  /usr/local/bin/mediaflow-proxy-light /etc/systemd/system/mediaflow-proxy-light.service
+  /etc/mediaflow-proxy-light`
+
 ## Configuration
 
 Loaded from environment variables → TOML file (`CONFIG_PATH`, see
