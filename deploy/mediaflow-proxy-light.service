@@ -1,0 +1,43 @@
+# systemd unit for a native install — set up by deploy/install.sh.
+# Configuration lives in /etc/mediaflow-proxy-light/env (APP__* variables).
+
+[Unit]
+Description=MediaFlow Proxy Light
+Documentation=https://github.com/buildermaxi/mediaflow-proxy-light
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/mediaflow-proxy-light
+EnvironmentFile=/etc/mediaflow-proxy-light/env
+Restart=always
+RestartSec=2
+# Each proxied stream holds two sockets; the default soft limit (1024) is low.
+LimitNOFILE=65536
+
+# Sandboxing. The proxy is stateless: it never writes to disk and only needs
+# outbound and inbound TCP, so everything else is locked away.
+DynamicUser=yes
+ProtectHome=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
