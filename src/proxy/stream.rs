@@ -2,10 +2,14 @@ use actix_web::web::Bytes;
 use dashmap::DashMap;
 use futures::{Stream, StreamExt};
 use reqwest::{Client, Proxy, Response};
+use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::task::{Context, Poll};
 use std::time::Instant;
-use tokio::sync::Semaphore;
+use tokio::runtime::Runtime;
+use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 use tracing::error;
 
@@ -15,13 +19,101 @@ use crate::{
     metrics::upstream::{ByteTally, UpstreamStats},
 };
 
+/// Body chunks buffered between an upstream task and the client-facing body.
+///
+/// Bounds per-stream memory (reqwest chunks are a few KiB to a few tens of
+/// KiB) and carries back-pressure: once a slow client lets the buffer fill
+/// up, the upstream task stops reading and TCP flow control throttles the
+/// origin.
+const BODY_CHANNEL_CAPACITY: usize = 16;
+
+/// Name of the upstream runtime's threads (≤ 15 bytes so `top -H` shows it whole).
+const UPSTREAM_THREAD_NAME: &str = "upstream-io";
+
+/// The multi-threaded runtime that performs every upstream request.
+///
+/// actix-web pins each client connection to one worker thread for its whole
+/// life, and actix-server hands connections to workers round-robin. Doing
+/// the upstream work (TLS decryption, mostly) on that worker made a worker's
+/// share of the CPU depend on which connections happened to land on it:
+/// behind a reverse proxy that opens and closes keep-alive connections all
+/// the time, concurrent streams regularly piled up on a single worker and
+/// capped total throughput at one core while the others sat idle.
+///
+/// Running upstream I/O here instead lets Tokio's work-stealing scheduler
+/// spread it over every core, whichever worker accepted the client. The
+/// actix workers only relay the decrypted chunks, which is cheap.
+fn upstream_runtime() -> &'static Runtime {
+    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(threads)
+            .thread_name(UPSTREAM_THREAD_NAME)
+            .enable_all()
+            .build()
+            .expect("Failed to build the upstream I/O runtime")
+    })
+}
+
+/// Spawn `fut` on the upstream runtime.
+///
+/// The returned handle aborts the task when dropped, so a cancelled caller
+/// (client gone, handler timed out) never leaves an upstream request
+/// running or a per-host permit held.
+fn spawn_upstream<F, T>(fut: F) -> UpstreamTask<T>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    UpstreamTask(upstream_runtime().spawn(fut))
+}
+
+/// A task on the upstream runtime, aborted when dropped.
+struct UpstreamTask<T>(JoinHandle<T>);
+
+impl<T> Drop for UpstreamTask<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl<T> Future for UpstreamTask<T> {
+    type Output = AppResult<T>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.0)
+            .poll(cx)
+            .map_err(|e| AppError::Internal(format!("Upstream task failed: {e}")))
+    }
+}
+
+/// Client-facing body of a proxied stream, fed by its upstream task.
+///
+/// Dropping it (response fully sent, or client disconnected) aborts the
+/// task, which closes the upstream connection and releases the per-host
+/// permit, even if the origin is stalled mid-body.
+pub struct UpstreamBody {
+    chunks: mpsc::Receiver<AppResult<Bytes>>,
+    _task: UpstreamTask<()>,
+}
+
+impl Stream for UpstreamBody {
+    type Item = AppResult<Bytes>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.chunks.poll_recv(cx)
+    }
+}
+
 #[derive(Clone)]
 pub struct StreamManager {
-    /// Per-thread clients — each actix-web worker thread gets its own reqwest
-    /// Client and connection pool.  This eliminates pool contention at high
-    /// concurrency: c=50 across 8 workers becomes c≈6 per pool instead of
-    /// one shared pool serialising 50 simultaneous checkout/connect operations.
-    per_thread_clients: Arc<DashMap<std::thread::ThreadId, Client>>,
+    /// Client for upstream requests that match no transport route. Shared
+    /// by every request: all of them run on the upstream runtime, so its
+    /// connection pool and the tasks driving its connections live there.
+    default_client: Client,
     /// Per-route client cache — keyed by a hash of the route config so we
     /// never create more than one client per unique (proxy_url, verify_ssl)
     /// combination, even under high concurrency.
@@ -31,8 +123,8 @@ pub struct StreamManager {
     /// many requests target the same host, which dramatically reduces
     /// per-request latency for bursts to a single upstream.
     per_host_semaphores: Arc<DashMap<String, Arc<Semaphore>>>,
-    config: ProxyConfig,
-    proxy_router: ProxyRouter,
+    config: Arc<ProxyConfig>,
+    proxy_router: Arc<ProxyRouter>,
     /// Per-host health for the dashboard; `None` when not wired up.
     upstream_stats: Option<Arc<UpstreamStats>>,
 }
@@ -40,13 +132,14 @@ pub struct StreamManager {
 impl StreamManager {
     pub fn new(config: ProxyConfig) -> Self {
         let proxy_router = ProxyRouter::from_config(&config);
+        let default_client = Self::create_default_client(&config, &proxy_router);
 
         Self {
-            per_thread_clients: Arc::new(DashMap::new()),
+            default_client,
             route_clients: Arc::new(DashMap::new()),
             per_host_semaphores: Arc::new(DashMap::new()),
-            config,
-            proxy_router,
+            config: Arc::new(config),
+            proxy_router: Arc::new(proxy_router),
             upstream_stats: None,
         }
     }
@@ -93,17 +186,6 @@ impl StreamManager {
         self.per_host_semaphores
             .insert(host.to_string(), sem.clone());
         Some(sem)
-    }
-
-    /// Get or create the reqwest Client for the current worker thread.
-    fn thread_client(&self) -> Client {
-        let tid = std::thread::current().id();
-        if let Some(c) = self.per_thread_clients.get(&tid) {
-            return c.clone();
-        }
-        let c = Self::create_default_client(&self.config, &self.proxy_router);
-        self.per_thread_clients.insert(tid, c.clone());
-        c
     }
 
     /// Build the default shared client used when no transport route matches.
@@ -208,20 +290,26 @@ impl StreamManager {
             .unwrap_or_else(|| "_unknown_".to_string())
     }
 
+    /// Send a request upstream and return the response for the caller to
+    /// consume (e.g. `.json()`).
+    ///
+    /// The request runs on the upstream runtime. The per-host permit covers
+    /// connect + response headers and is released when the response is
+    /// returned; streaming callers should use `create_stream`, which holds
+    /// it until the body is done.
     pub async fn make_request(
         &self,
         url: String,
         headers: reqwest::header::HeaderMap,
     ) -> AppResult<Response> {
-        // Hold the permit for the full call — when the returned Response is
-        // consumed by the caller (e.g. `.bytes()` in fetch_bytes), the permit
-        // still applies since we already acquired it here and it drops when
-        // this function returns.  For streaming callers, prefer
-        // `create_stream` which carries the permit with the body.
-        let _permit = self.acquire_host_permit(&url).await?;
-        self.make_request_raw(url, headers)
-            .await
-            .map(|(response, _)| response)
+        let this = self.clone();
+        spawn_upstream(async move {
+            let _permit = this.acquire_host_permit(&url).await?;
+            this.make_request_raw(url, headers)
+                .await
+                .map(|(response, _)| response)
+        })
+        .await?
     }
 
     /// Acquire a permit from the per-host semaphore.  Returns an owned permit
@@ -246,6 +334,9 @@ impl StreamManager {
     /// Inner request without the per-host limiter — used when the caller
     /// has already acquired a permit and wants to carry it with the body.
     /// The returned tally counts body bytes against the upstream host.
+    ///
+    /// Must run on the upstream runtime (see `spawn_upstream`): the client
+    /// spawns the task driving a new connection on the current runtime.
     async fn make_request_raw(
         &self,
         url: String,
@@ -269,7 +360,7 @@ impl StreamManager {
                 new_client
             }
         } else {
-            self.thread_client()
+            self.default_client.clone()
         };
 
         // Apply timeout only to the connection + response-headers phase.
@@ -302,6 +393,16 @@ impl StreamManager {
         Ok((response, tally))
     }
 
+    /// Open `url` upstream and return its status, headers and (unless
+    /// `is_head`) a body stream.
+    ///
+    /// Everything upstream (connect, TLS, reading the body) happens in a task
+    /// on the upstream runtime, which forwards body chunks through a bounded
+    /// channel. The task holds the per-host permit for the whole transfer:
+    /// this caps parallel in-flight upstream connections per host at
+    /// `config.max_concurrent_per_host`, forcing HTTP/1.1 keep-alive reuse
+    /// when many requests target the same origin. Dropping the returned body,
+    /// or this future before it resolves, aborts the task.
     pub async fn create_stream(
         &self,
         url: String,
@@ -310,41 +411,53 @@ impl StreamManager {
     ) -> AppResult<(
         reqwest::StatusCode,
         reqwest::header::HeaderMap,
-        Option<impl Stream<Item = Result<Bytes, AppError>>>,
+        Option<UpstreamBody>,
     )> {
-        // Acquire the per-host slot BEFORE dispatching.  For streaming, the
-        // permit will be moved into the body stream closure so it lives until
-        // the body is fully read (or the client disconnects and the stream
-        // is dropped).  This caps parallel in-flight upstream connections per
-        // host at `config.max_concurrent_per_host`, forcing HTTP/1.1 keep-alive
-        // reuse when many requests target the same origin — eliminating
-        // repeated TCP handshake + TLS cost for warm connections.
-        //
-        // Returns `None` when the limiter is disabled (max_concurrent_per_host = 0).
-        let permit = self.acquire_host_permit(&url).await?;
-        let (response, tally) = self.make_request_raw(url, headers).await?;
-        let status = response.status();
-        let response_headers = response.headers().clone();
+        let (head_tx, head_rx) = oneshot::channel();
+        let (body_tx, body_rx) = mpsc::channel(BODY_CHANNEL_CAPACITY);
+        let this = self.clone();
 
-        if is_head {
-            return Ok((status, response_headers, None));
-        }
+        let task = spawn_upstream(async move {
+            let opened = async {
+                let permit = this.acquire_host_permit(&url).await?;
+                let (response, tally) = this.make_request_raw(url, headers).await?;
+                Ok::<_, AppError>((permit, response, tally))
+            };
+            let (permit, response, tally) = match opened.await {
+                Ok(opened) => opened,
+                Err(e) => {
+                    let _ = head_tx.send(Err(e));
+                    return;
+                }
+            };
 
-        // Zero-copy streaming: chunks from reqwest are forwarded directly to
-        // actix-web without any intermediate buffering.  Memory usage stays
-        // bounded regardless of response size or concurrency.  The permit
-        // is held inside the map closure so it drops (releasing the slot)
-        // only when the stream ends or is dropped.
-        let stream = response.bytes_stream().map(move |result| {
-            // Keep the permit alive for each chunk's poll — it drops
-            // when the stream is exhausted or cancelled.
-            let _keep = &permit;
-            if let Ok(chunk) = &result {
-                tally.add(chunk.len());
+            let head = (response.status(), response.headers().clone());
+            if head_tx.send(Ok(head)).is_err() || is_head {
+                return;
             }
-            result.map_err(|e| AppError::Proxy(format!("Stream error: {}", e)))
+
+            let mut chunks = response.bytes_stream();
+            while let Some(chunk) = chunks.next().await {
+                let chunk = chunk
+                    .inspect(|bytes| tally.add(bytes.len()))
+                    .map_err(|e| AppError::Proxy(format!("Stream error: {}", e)));
+                let failed = chunk.is_err();
+                if body_tx.send(chunk).await.is_err() || failed {
+                    break;
+                }
+            }
+            drop(permit);
         });
-        Ok((status, response_headers, Some(stream)))
+
+        let (status, response_headers) = head_rx.await.map_err(|_| {
+            AppError::Internal("Upstream task ended before the response headers".to_string())
+        })??;
+
+        let body = (!is_head).then(|| UpstreamBody {
+            chunks: body_rx,
+            _task: task,
+        });
+        Ok((status, response_headers, body))
     }
 
     /// Wrap a stream so that errors are logged with the byte offset.
@@ -396,5 +509,181 @@ where
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         self.inner.as_mut().poll_next(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use reqwest::header::HeaderMap;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    const PIECE: usize = 16 * 1024;
+
+    /// Minimal HTTP/1.1 origin, one request per connection. Answers each
+    /// request with a body of `len` bytes, written in 16 KiB pieces with
+    /// `pause` between them. Requests for `/hang` get no answer at all;
+    /// `/missing` gets a 404.
+    async fn origin(len: usize, pause: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&request);
+                    if request.contains(" /hang ") {
+                        std::future::pending::<()>().await;
+                    }
+                    let status = if request.contains(" /missing ") {
+                        "404 Not Found"
+                    } else {
+                        "200 OK"
+                    };
+                    let head = format!(
+                        "HTTP/1.1 {status}\r\ncontent-length: {len}\r\nconnection: close\r\n\r\n"
+                    );
+                    if socket.write_all(head.as_bytes()).await.is_err()
+                        || request.starts_with("HEAD")
+                    {
+                        return;
+                    }
+                    let piece = [b'x'; PIECE];
+                    let mut sent = 0;
+                    while sent < len {
+                        let n = PIECE.min(len - sent);
+                        if socket.write_all(&piece[..n]).await.is_err() {
+                            return;
+                        }
+                        sent += n;
+                        tokio::time::sleep(pause).await;
+                    }
+                });
+            }
+        });
+        base
+    }
+
+    fn manager(max_concurrent_per_host: usize) -> StreamManager {
+        let mut config = Config::from_env().expect("default config").proxy;
+        config.max_concurrent_per_host = max_concurrent_per_host;
+        StreamManager::new(config)
+    }
+
+    async fn body_len(body: UpstreamBody) -> usize {
+        body.fold(
+            0,
+            |total, chunk| async move { total + chunk.unwrap().len() },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn upstream_work_runs_on_the_upstream_runtime() {
+        let thread = spawn_upstream(async { std::thread::current().name().map(String::from) })
+            .await
+            .unwrap();
+        assert_eq!(thread.as_deref(), Some(UPSTREAM_THREAD_NAME));
+    }
+
+    #[tokio::test]
+    async fn streams_the_whole_body() {
+        let base = origin(1_000_000, Duration::ZERO).await;
+        let (status, headers, body) = manager(10)
+            .create_stream(format!("{base}/file.mkv"), HeaderMap::new(), false)
+            .await
+            .unwrap();
+
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(headers["content-length"], "1000000");
+        assert_eq!(body_len(body.unwrap()).await, 1_000_000);
+    }
+
+    #[tokio::test]
+    async fn upstream_error_status_is_reported() {
+        let base = origin(10, Duration::ZERO).await;
+        let result = manager(10)
+            .create_stream(format!("{base}/missing"), HeaderMap::new(), false)
+            .await;
+
+        assert!(matches!(result, Err(AppError::Upstream(_))));
+    }
+
+    #[tokio::test]
+    async fn head_request_has_no_body_and_frees_the_host_slot() {
+        let base = origin(1_000, Duration::ZERO).await;
+        let manager = manager(1);
+
+        let (status, _, body) = manager
+            .create_stream(format!("{base}/file.mkv"), HeaderMap::new(), true)
+            .await
+            .unwrap();
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert!(body.is_none());
+
+        let next = timeout(
+            Duration::from_secs(5),
+            manager.create_stream(format!("{base}/file.mkv"), HeaderMap::new(), false),
+        )
+        .await
+        .expect("host slot still held after HEAD")
+        .unwrap();
+        assert_eq!(body_len(next.2.unwrap()).await, 1_000);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_body_frees_the_host_slot_even_if_upstream_stalls() {
+        // One piece, then the origin stalls for an hour mid-body: only
+        // aborting the upstream task can release the permit.
+        let base = origin(10 * PIECE, Duration::from_secs(3600)).await;
+        let manager = manager(1);
+
+        let (_, _, body) = manager
+            .create_stream(format!("{base}/file.mkv"), HeaderMap::new(), false)
+            .await
+            .unwrap();
+        let mut body = body.unwrap();
+        assert!(body.next().await.unwrap().is_ok());
+        drop(body);
+
+        let (_, _, next) = timeout(
+            Duration::from_secs(5),
+            manager.create_stream(format!("{base}/file.mkv"), HeaderMap::new(), false),
+        )
+        .await
+        .expect("host slot still held after the client went away")
+        .unwrap();
+        assert!(next.is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_frees_the_host_slot() {
+        let base = origin(1_000, Duration::ZERO).await;
+        let manager = manager(1);
+
+        let hung = timeout(
+            Duration::from_millis(300),
+            manager.create_stream(format!("{base}/hang"), HeaderMap::new(), false),
+        )
+        .await;
+        assert!(hung.is_err(), "origin was expected to never answer");
+
+        let (_, _, next) = timeout(
+            Duration::from_secs(5),
+            manager.create_stream(format!("{base}/file.mkv"), HeaderMap::new(), false),
+        )
+        .await
+        .expect("host slot still held after the caller gave up")
+        .unwrap();
+        assert_eq!(body_len(next.unwrap()).await, 1_000);
     }
 }

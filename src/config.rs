@@ -86,7 +86,7 @@ pub struct ProxyConfig {
     #[serde(default = "default_pool_idle_timeout")]
     pub pool_idle_timeout: u64,
 
-    /// Maximum idle upstream connections retained per host per worker.
+    /// Maximum idle upstream connections retained per host.
     ///
     /// Default: `100`.
     #[serde(default = "default_pool_max_idle_per_host")]
