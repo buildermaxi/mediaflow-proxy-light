@@ -6,9 +6,9 @@
 #
 # Re-run it to update; it only restarts the service when something changed.
 #
-# Optional environment variables:
-#   MEDIAFLOW_VERSION       release tag to install instead of the latest one
-#   MEDIAFLOW_API_PASSWORD  API password written on first install (default: random)
+# Set MEDIAFLOW_VERSION=<release tag> to install that release instead of the
+# latest one. A random API password is generated on first install; change it in
+# /etc/mediaflow-proxy-light/env.
 #
 # Requires 64-bit Linux (x86_64 or arm64), systemd and glibc 2.36+ (Debian 12,
 # Raspberry Pi OS Bookworm, Ubuntu 22.10 or newer).
@@ -34,6 +34,7 @@ die() { echo "error: $*" >&2; exit 1; }
 [[ $EUID -eq 0 ]] || die "run as root, e.g. with sudo"
 command -v systemctl >/dev/null || die "systemd is required"
 command -v curl >/dev/null || die "curl is required"
+command -v ss >/dev/null || die "ss (iproute2) is required"
 
 # The userland's word size, not the kernel's: 32-bit Raspberry Pi OS boots a
 # 64-bit kernel on a Pi 4, so `uname -m` alone would say aarch64.
@@ -80,52 +81,57 @@ install_file "$tmp/$NAME.service" "$UNIT" 644
 first_install=0
 if [[ ! -f $ENV_FILE ]]; then
     first_install=1
-    password=${MEDIAFLOW_API_PASSWORD:-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')}
+    password=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
     install -d -m 755 "$CONF_DIR"
     (
         umask 077
         cat >"$ENV_FILE" <<EOF
-# MediaFlow Proxy Light configuration, see
-# https://github.com/$REPO#configuration
+# MediaFlow Proxy Light configuration: one VAR=value per line, no trailing
+# comments. Variables: https://github.com/$REPO#configuration
 # Apply changes with: sudo systemctl restart $NAME
 APP__SERVER__HOST=0.0.0.0
 APP__SERVER__PORT=8888
 APP__AUTH__API_PASSWORD=$password
-RUST_LOG=info
 EOF
     )
+    # Shown right away, so it isn't lost if the service then fails to start.
+    echo "Generated API password: $password (stored in $ENV_FILE)"
 fi
 
 systemctl daemon-reload
 systemctl enable --quiet "$NAME"
-if [[ $changed -eq 1 ]] || ! systemctl is-active --quiet "$NAME"; then
-    systemctl restart "$NAME"
+if [[ $first_install -eq 1 ]]; then
+    status=installed
+elif [[ $changed -eq 1 ]]; then
+    status=updated
+elif ! systemctl is-active --quiet "$NAME"; then
+    status=started
+else
+    status=current
 fi
+[[ $status == current ]] || systemctl restart "$NAME"
 
-port=$(sed -n 's/^APP__SERVER__PORT=//p' "$ENV_FILE" | tail -n1)
-port=${port:-8888}
-healthy=0
+# Wait for the service's own process to listen. Probing the port instead could
+# be answered by something else, e.g. a Docker container still bound to it.
+listen=""
 for _ in $(seq 20); do
-    if curl -fsS -o /dev/null "http://127.0.0.1:$port/health" 2>/dev/null; then
-        healthy=1
-        break
+    pid=$(systemctl show -p MainPID --value "$NAME")
+    if [[ $pid != 0 ]]; then
+        listen=$(ss -Hltnp | awk -v p="pid=$pid," 'index($0, p) && !found {print $4; found = 1}')
+        [[ -n $listen ]] && break
     fi
     sleep 0.5
 done
-if [[ $healthy -eq 0 ]]; then
+if [[ -z $listen ]]; then
     journalctl -u "$NAME" -n 20 --no-pager >&2 || true
-    die "$NAME did not answer on port $port, see: journalctl -u $NAME"
+    die "$NAME is not listening (port already in use?), see: journalctl -u $NAME"
 fi
+port=${listen##*:}
 
-host=$(hostname -I 2>/dev/null | awk '{print $1}')
-if [[ $first_install -eq 1 ]]; then
-    echo "$NAME installed and running on http://${host:-<this-host>}:$port"
-    if [[ -z ${MEDIAFLOW_API_PASSWORD:-} ]]; then
-        echo "API password: $password"
-    fi
-    echo "Configuration: $ENV_FILE"
-elif [[ $changed -eq 1 ]]; then
-    echo "$NAME updated and restarted"
-else
-    echo "$NAME is already up to date"
-fi
+host=$(hostname -I 2>/dev/null | awk '{print $1}') || true
+case $status in
+    installed) echo "$NAME installed and running on http://${host:-<this-host>}:$port" ;;
+    updated) echo "$NAME updated and restarted" ;;
+    started) echo "$NAME was not running, started it" ;;
+    current) echo "$NAME is already up to date" ;;
+esac

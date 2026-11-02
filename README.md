@@ -56,19 +56,20 @@ service, listening on port 8888:
 curl -fsSL https://github.com/buildermaxi/mediaflow-proxy-light/releases/latest/download/install.sh | sudo bash
 ```
 
-A random API password is generated and printed on first install; pass
-`MEDIAFLOW_API_PASSWORD=…` after `sudo` to choose it instead. On a Raspberry Pi the OS
-must be the **64-bit** Raspberry Pi OS: check that `dpkg --print-architecture` prints
+A random API password is generated and printed on first install. On a Raspberry Pi the
+OS must be the **64-bit** Raspberry Pi OS: check that `dpkg --print-architecture` prints
 `arm64`.
 
-- **Configuration:** `/etc/mediaflow-proxy-light/env` (the `APP__*` variables below), then
-  `sudo systemctl restart mediaflow-proxy-light`
+- **Configuration:** `/etc/mediaflow-proxy-light/env`, then
+  `sudo systemctl restart mediaflow-proxy-light`. It takes the `APP__*` variables below,
+  one `VAR=value` per line: systemd doesn't allow comments at the end of a line, so leave
+  out the `# …` notes. That's also where you change the API password.
 - **Logs:** `journalctl -u mediaflow-proxy-light -f`
 - **Update:** run the same command again; it only restarts the service when the binary
   changed. Set `MEDIAFLOW_VERSION=<release tag>` after `sudo` to install a given release.
 - **Uninstall:** `sudo systemctl disable --now mediaflow-proxy-light && sudo rm -r
   /usr/local/bin/mediaflow-proxy-light /etc/systemd/system/mediaflow-proxy-light.service
-  /etc/mediaflow-proxy-light`
+  /etc/mediaflow-proxy-light && sudo systemctl daemon-reload`
 
 ## Configuration
 
