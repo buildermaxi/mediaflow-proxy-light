@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Instant;
 use tokio::runtime::Runtime;
-use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 use tracing::error;
@@ -19,13 +19,23 @@ use crate::{
     metrics::upstream::{ByteTally, UpstreamStats},
 };
 
-/// Body chunks buffered between an upstream task and the client-facing body.
+/// Body bytes an upstream task may read ahead of its client.
 ///
-/// Bounds per-stream memory (reqwest chunks are a few KiB to a few tens of
-/// KiB) and carries back-pressure: once a slow client lets the buffer fill
-/// up, the upstream task stops reading and TCP flow control throttles the
-/// origin.
-const BODY_CHANNEL_CAPACITY: usize = 16;
+/// Bounds per-stream memory and the data fetched for nothing when a player
+/// seeks or goes away, and carries back-pressure: once a slow client lets
+/// the buffer fill up, the upstream task stops reading and TCP flow control
+/// throttles the origin. Counted in bytes because chunk sizes vary a lot:
+/// one TLS record (≤ 16 KiB) per chunk over HTTPS, but up to hyper's read
+/// buffer (hundreds of KiB) from a fast plain-HTTP origin. A chunk larger
+/// than the whole budget still goes through, alone.
+const BODY_BUFFER_BYTES: usize = 256 * 1024;
+
+/// Upper bound on queued chunks, so tiny chunks can't pile up either.
+const BODY_CHANNEL_CAPACITY: usize = 64;
+
+/// A body chunk on its way to the client, holding its share of the
+/// read-ahead budget until the client-facing body hands it out.
+type QueuedChunk = (AppResult<Bytes>, OwnedSemaphorePermit);
 
 /// Name of the upstream runtime's threads (≤ 15 bytes so `top -H` shows it whole).
 const UPSTREAM_THREAD_NAME: &str = "upstream-io";
@@ -96,7 +106,7 @@ impl<T> Future for UpstreamTask<T> {
 /// task, which closes the upstream connection and releases the per-host
 /// permit, even if the origin is stalled mid-body.
 pub struct UpstreamBody {
-    chunks: mpsc::Receiver<AppResult<Bytes>>,
+    chunks: mpsc::Receiver<QueuedChunk>,
     _task: UpstreamTask<()>,
 }
 
@@ -104,7 +114,10 @@ impl Stream for UpstreamBody {
     type Item = AppResult<Bytes>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.chunks.poll_recv(cx)
+        // Dropping the permit gives the chunk's bytes back to the read-ahead budget.
+        self.chunks
+            .poll_recv(cx)
+            .map(|queued| queued.map(|(chunk, _permit)| chunk))
     }
 }
 
@@ -131,6 +144,9 @@ pub struct StreamManager {
 
 impl StreamManager {
     pub fn new(config: ProxyConfig) -> Self {
+        // Start the upstream runtime now, so a failure to spawn its threads
+        // stops the server at startup rather than on the first request.
+        upstream_runtime();
         let proxy_router = ProxyRouter::from_config(&config);
         let default_client = Self::create_default_client(&config, &proxy_router);
 
@@ -179,12 +195,13 @@ impl StreamManager {
         if self.config.max_concurrent_per_host == 0 {
             return None;
         }
-        if let Some(s) = self.per_host_semaphores.get(host) {
-            return Some(s.clone());
-        }
-        let sem = Arc::new(Semaphore::new(self.config.max_concurrent_per_host));
-        self.per_host_semaphores
-            .insert(host.to_string(), sem.clone());
+        // `entry` locks the shard, so two first requests to a host can't each
+        // create (and use) their own semaphore.
+        let sem = self
+            .per_host_semaphores
+            .entry(host.to_string())
+            .or_insert_with(|| Arc::new(Semaphore::new(self.config.max_concurrent_per_host)))
+            .clone();
         Some(sem)
     }
 
@@ -397,8 +414,9 @@ impl StreamManager {
     /// `is_head`) a body stream.
     ///
     /// Everything upstream (connect, TLS, reading the body) happens in a task
-    /// on the upstream runtime, which forwards body chunks through a bounded
-    /// channel. The task holds the per-host permit for the whole transfer:
+    /// on the upstream runtime, which forwards body chunks through a channel,
+    /// at most `BODY_BUFFER_BYTES` ahead of the client. The task holds the
+    /// per-host permit for the whole transfer:
     /// this caps parallel in-flight upstream connections per host at
     /// `config.max_concurrent_per_host`, forcing HTTP/1.1 keep-alive reuse
     /// when many requests target the same origin. Dropping the returned body,
@@ -436,13 +454,19 @@ impl StreamManager {
                 return;
             }
 
+            let read_ahead = Arc::new(Semaphore::new(BODY_BUFFER_BYTES));
             let mut chunks = response.bytes_stream();
             while let Some(chunk) = chunks.next().await {
                 let chunk = chunk
                     .inspect(|bytes| tally.add(bytes.len()))
                     .map_err(|e| AppError::Proxy(format!("Stream error: {}", e)));
                 let failed = chunk.is_err();
-                if body_tx.send(chunk).await.is_err() || failed {
+                // Bounded by the budget itself, so the cast can't truncate.
+                let size = chunk.as_ref().map_or(0, Bytes::len).min(BODY_BUFFER_BYTES) as u32;
+                let Ok(room) = read_ahead.clone().acquire_many_owned(size).await else {
+                    break;
+                };
+                if body_tx.send((chunk, room)).await.is_err() || failed {
                     break;
                 }
             }
@@ -515,7 +539,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
     use reqwest::header::HeaderMap;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -524,8 +547,9 @@ mod tests {
 
     /// Minimal HTTP/1.1 origin, one request per connection. Answers each
     /// request with a body of `len` bytes, written in 16 KiB pieces with
-    /// `pause` between them. Requests for `/hang` get no answer at all;
-    /// `/missing` gets a 404.
+    /// `pause` between them. Special paths: `/hang` gets no answer at all,
+    /// `/missing` a 404, and `/truncated` loses its connection after the
+    /// first piece.
     async fn origin(len: usize, pause: Duration) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -552,16 +576,16 @@ mod tests {
                     let head = format!(
                         "HTTP/1.1 {status}\r\ncontent-length: {len}\r\nconnection: close\r\n\r\n"
                     );
-                    if socket.write_all(head.as_bytes()).await.is_err()
-                        || request.starts_with("HEAD")
-                    {
+                    if socket.write_all(head.as_bytes()).await.is_err() {
                         return;
                     }
                     let piece = [b'x'; PIECE];
                     let mut sent = 0;
                     while sent < len {
                         let n = PIECE.min(len - sent);
-                        if socket.write_all(&piece[..n]).await.is_err() {
+                        if socket.write_all(&piece[..n]).await.is_err()
+                            || request.contains(" /truncated ")
+                        {
                             return;
                         }
                         sent += n;
@@ -573,10 +597,45 @@ mod tests {
         base
     }
 
+    /// Built by hand rather than from the environment, so proxy or config
+    /// variables set on the machine running the tests can't change them.
     fn manager(max_concurrent_per_host: usize) -> StreamManager {
-        let mut config = Config::from_env().expect("default config").proxy;
-        config.max_concurrent_per_host = max_concurrent_per_host;
-        StreamManager::new(config)
+        StreamManager::new(ProxyConfig {
+            connect_timeout: 5,
+            follow_redirects: true,
+            proxy_url: None,
+            all_proxy: false,
+            transport_routes: Default::default(),
+            request_timeout_factor: 8,
+            max_concurrent_per_host,
+            pool_idle_timeout: 90,
+            pool_max_idle_per_host: 100,
+        })
+    }
+
+    /// Free per-host slots for the origin at `base`.
+    fn free_slots(manager: &StreamManager, base: &str) -> usize {
+        manager
+            .host_semaphore(&StreamManager::url_host_key(base))
+            .unwrap()
+            .available_permits()
+    }
+
+    /// Poll `fut` until the origin at `base` has no free slot left, i.e. the
+    /// request is in flight upstream, then drop it.
+    async fn cancel_once_in_flight<F: Future>(fut: F, manager: &StreamManager, base: &str) {
+        tokio::pin!(fut);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while free_slots(manager, base) > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "request never took the host slot"
+            );
+            tokio::select! {
+                _ = &mut fut => panic!("request was expected to hang"),
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
+        }
     }
 
     async fn body_len(body: UpstreamBody) -> usize {
@@ -585,6 +644,17 @@ mod tests {
             |total, chunk| async move { total + chunk.unwrap().len() },
         )
         .await
+    }
+
+    async fn open(manager: &StreamManager, url: String) -> UpstreamBody {
+        let (_, _, body) = timeout(
+            Duration::from_secs(5),
+            manager.create_stream(url, HeaderMap::new(), false),
+        )
+        .await
+        .expect("host slot was not released in time")
+        .unwrap();
+        body.unwrap()
     }
 
     #[tokio::test]
@@ -619,6 +689,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upstream_failure_mid_body_ends_the_stream_with_an_error() {
+        let base = origin(10 * PIECE, Duration::ZERO).await;
+        let body = open(&manager(10), format!("{base}/truncated")).await;
+
+        let items: Vec<_> = body.collect().await;
+        assert!(matches!(items.last(), Some(Err(AppError::Proxy(_)))));
+        let received: usize = items.iter().flatten().map(Bytes::len).sum();
+        assert!(received < 10 * PIECE);
+    }
+
+    #[tokio::test]
+    async fn read_ahead_is_bounded_in_bytes() {
+        let base = origin(64 * 1024 * 1024, Duration::ZERO).await;
+        let mut body = open(&manager(10), format!("{base}/file.mkv")).await;
+
+        // Let the upstream task fill its buffer, then take what it queued,
+        // keeping each chunk's share of the budget so nothing is refilled.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut queued = Vec::new();
+        while let Ok(item) = body.chunks.try_recv() {
+            queued.push(item);
+        }
+        let bytes: usize = queued
+            .iter()
+            .map(|(chunk, _)| chunk.as_ref().unwrap().len())
+            .sum();
+
+        assert!(!queued.is_empty(), "upstream task read nothing ahead");
+        // A chunk bigger than the whole budget is let through alone.
+        assert!(
+            bytes <= BODY_BUFFER_BYTES || queued.len() == 1,
+            "{bytes} bytes in {} chunks read ahead",
+            queued.len()
+        );
+    }
+
+    #[tokio::test]
     async fn head_request_has_no_body_and_frees_the_host_slot() {
         let base = origin(1_000, Duration::ZERO).await;
         let manager = manager(1);
@@ -630,14 +737,30 @@ mod tests {
         assert_eq!(status, reqwest::StatusCode::OK);
         assert!(body.is_none());
 
-        let next = timeout(
-            Duration::from_secs(5),
+        let next = open(&manager, format!("{base}/file.mkv")).await;
+        assert_eq!(body_len(next).await, 1_000);
+    }
+
+    #[tokio::test]
+    async fn host_slot_is_held_until_the_body_is_dropped() {
+        let base = origin(100 * PIECE, Duration::from_millis(20)).await;
+        let manager = manager(1);
+
+        let mut body = open(&manager, format!("{base}/file.mkv")).await;
+        assert!(body.next().await.unwrap().is_ok());
+        assert_eq!(free_slots(&manager, &base), 0);
+        let second = timeout(
+            Duration::from_millis(300),
             manager.create_stream(format!("{base}/file.mkv"), HeaderMap::new(), false),
         )
-        .await
-        .expect("host slot still held after HEAD")
-        .unwrap();
-        assert_eq!(body_len(next.2.unwrap()).await, 1_000);
+        .await;
+        assert!(
+            second.is_err(),
+            "second stream got a slot while the first was open"
+        );
+
+        drop(body);
+        open(&manager, format!("{base}/file.mkv")).await;
     }
 
     #[tokio::test]
@@ -647,43 +770,42 @@ mod tests {
         let base = origin(10 * PIECE, Duration::from_secs(3600)).await;
         let manager = manager(1);
 
-        let (_, _, body) = manager
-            .create_stream(format!("{base}/file.mkv"), HeaderMap::new(), false)
-            .await
-            .unwrap();
-        let mut body = body.unwrap();
+        let mut body = open(&manager, format!("{base}/file.mkv")).await;
         assert!(body.next().await.unwrap().is_ok());
         drop(body);
 
-        let (_, _, next) = timeout(
-            Duration::from_secs(5),
-            manager.create_stream(format!("{base}/file.mkv"), HeaderMap::new(), false),
-        )
-        .await
-        .expect("host slot still held after the client went away")
-        .unwrap();
-        assert!(next.is_some());
+        open(&manager, format!("{base}/file.mkv")).await;
     }
 
     #[tokio::test]
-    async fn cancelled_request_frees_the_host_slot() {
+    async fn cancelled_stream_request_frees_the_host_slot() {
         let base = origin(1_000, Duration::ZERO).await;
         let manager = manager(1);
 
-        let hung = timeout(
-            Duration::from_millis(300),
-            manager.create_stream(format!("{base}/hang"), HeaderMap::new(), false),
-        )
-        .await;
-        assert!(hung.is_err(), "origin was expected to never answer");
+        let hung = manager.create_stream(format!("{base}/hang"), HeaderMap::new(), false);
+        cancel_once_in_flight(hung, &manager, &base).await;
 
-        let (_, _, next) = timeout(
+        assert_eq!(
+            body_len(open(&manager, format!("{base}/file.mkv")).await).await,
+            1_000
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_plain_request_frees_the_host_slot() {
+        let base = origin(1_000, Duration::ZERO).await;
+        let manager = manager(1);
+
+        let hung = manager.make_request(format!("{base}/hang"), HeaderMap::new());
+        cancel_once_in_flight(hung, &manager, &base).await;
+
+        let response = timeout(
             Duration::from_secs(5),
-            manager.create_stream(format!("{base}/file.mkv"), HeaderMap::new(), false),
+            manager.make_request(format!("{base}/file.mkv"), HeaderMap::new()),
         )
         .await
-        .expect("host slot still held after the caller gave up")
+        .expect("host slot was not released in time")
         .unwrap();
-        assert_eq!(body_len(next.unwrap()).await, 1_000);
+        assert_eq!(response.bytes().await.unwrap().len(), 1_000);
     }
 }
