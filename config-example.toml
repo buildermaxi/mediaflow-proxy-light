@@ -35,7 +35,7 @@ pool_idle_timeout = 90
 # Seconds an idle upstream connection is kept in the pool before being closed.
 
 pool_max_idle_per_host = 100
-# Maximum idle upstream connections retained per host per worker thread.
+# Maximum idle upstream connections retained per host.
 
 # Per-URL transport route overrides
 [proxy.transport_routes]
