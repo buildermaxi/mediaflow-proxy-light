@@ -14,11 +14,8 @@ async fn test_encryption_handler() {
 
     let proxy_data = ProxyData {
         destination: "https://example.com/video.mp4".to_string(),
-        query_params: None,
-        request_headers: None,
-        response_headers: None,
         exp: Some(future_timestamp),
-        ip: None,
+        ..Default::default()
     };
 
     let token = handler.encrypt(&proxy_data).unwrap();
@@ -34,11 +31,8 @@ async fn test_token_expiration() {
 
     let proxy_data = ProxyData {
         destination: "https://example.com/video.mp4".to_string(),
-        query_params: None,
-        request_headers: None,
-        response_headers: None,
         exp: Some(0), // Expired timestamp
-        ip: None,
+        ..Default::default()
     };
 
     let token = handler.encrypt(&proxy_data).unwrap();

@@ -8,10 +8,13 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::boxed::Box;
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crate::{
-    auth::{encryption::ProxyData, EncryptionHandler},
+    auth::{
+        encryption::{unix_now, ProxyData},
+        EncryptionHandler,
+    },
     config::ForwardConfig,
     error::{AppError, AppResult},
     models::request::{SUPPORTED_REQUEST_HEADERS, SUPPORTED_RESPONSE_HEADERS},
@@ -188,6 +191,7 @@ pub async fn proxy_stream_head(
 /// URL-building logic behind `POST /generate_urls`.
 ///
 /// Encrypted tokens use Python's path format: `{base}/_token_{token}{endpoint_path}`.
+/// The token is bound to `endpoint`, so encrypted URLs require one.
 /// Unencrypted tokens use flat query params matching Python's encode_mediaflow_proxy_url.
 /// When `base64_encode_destination` is true and no `api_password` is provided, the
 /// destination URL is base64url-encoded and embedded in the URL path instead of `d=`.
@@ -215,6 +219,11 @@ pub fn build_proxy_url(
         .unwrap_or_default();
 
     if let Some(password) = api_password.filter(|p| !p.is_empty()) {
+        if endpoint_path.is_empty() {
+            return Err(AppError::BadRequest(
+                "`endpoint` is required for encrypted URLs".to_string(),
+            ));
+        }
         let handler = EncryptionHandler::new(password.as_bytes()).map_err(|e| {
             AppError::Internal(format!("Failed to create encryption handler: {}", e))
         })?;
@@ -230,14 +239,9 @@ pub fn build_proxy_url(
             response_headers: Some(
                 serde_json::to_value(response_headers).map_err(AppError::SerdeJsonError)?,
             ),
-            exp: expiration.map(|e| {
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs()
-                    + e
-            }),
+            exp: expiration.map(|e| unix_now().saturating_add(e)),
             ip: ip.map(|s| s.to_string()),
+            endpoint: Some(endpoint_path.clone()),
         };
 
         let token = handler.encrypt(&proxy_data)?;

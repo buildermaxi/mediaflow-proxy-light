@@ -71,11 +71,10 @@ futures = "0.3"
 # `tls-rustls` feature flags (see [features] above).
 reqwest = { version = "0.12.28", default-features = false, features = ["stream", "json", "socks", "gzip", "deflate"] }
 
-# Crypto — AES-CBC for proxy-URL encryption, HMAC-SHA256 for the dashboard
-# session
-aes = "0.8"
-cbc = { version = "0.1", features = ["alloc"] }
-cipher = { version = "0.4", features = ["block-padding"] }
+# Crypto — AES-256-GCM (key from HKDF-SHA256) for proxy-URL tokens,
+# HMAC-SHA256 for the dashboard session
+aes-gcm = "0.10"
+hkdf = "0.12"
 hmac = "0.12"
 sha2 = "0.10"
 rand = "0.9.3"

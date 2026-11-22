@@ -343,19 +343,37 @@ mod tests {
             .expect("session cookie")
             .into_owned();
 
-        // Any stream token (they appear in every generated URL) passes the
-        // auth middleware, which then rewrites `/_token_…/<path>`.
+        // A stream token (they appear in every generated URL) is bound to
+        // `/proxy/stream`: the auth middleware refuses it on dashboard paths,
+        // however they are spelled.
         let token = EncryptionHandler::new(PASSWORD.as_bytes())
             .unwrap()
             .encrypt(&ProxyData {
                 destination: "https://example.com/movie.mkv".into(),
-                query_params: None,
-                request_headers: None,
-                response_headers: None,
-                exp: None,
-                ip: None,
+                endpoint: Some("/proxy/stream".into()),
+                ..Default::default()
             })
             .unwrap();
+        for uri in [
+            format!("/_token_{token}/dashboard/stats"),
+            format!("/_token_{token}/dashboard/%73tats"),
+        ] {
+            let refused = test::try_call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri(&uri)
+                    .cookie(cookie.clone())
+                    .to_request(),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{uri} must be refused"));
+            assert_eq!(
+                refused.error_response().status(),
+                StatusCode::UNAUTHORIZED,
+                "{uri}"
+            );
+        }
 
         // A page on another port of the same host is "same-site", so the
         // browser sends the cookie; without CORS headers it can't read the
@@ -365,8 +383,6 @@ mod tests {
             "/dashboard/stats".to_string(),
             "/dashboard/history".to_string(),
             format!("/dashboard/%73tats?api_password={PASSWORD}"),
-            format!("/_token_{token}/dashboard/stats"),
-            format!("/_token_{token}/dashboard/%73tats"),
         ] {
             let res = test::call_service(
                 &app,

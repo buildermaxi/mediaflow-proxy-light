@@ -158,8 +158,10 @@ where
                         .connection_info()
                         .realip_remote_addr()
                         .map(|s| s.to_string());
+                    // The token must decrypt *and* have been minted for the
+                    // endpoint this request is for.
                     let proxy_data = handler
-                        .decrypt(token, client_ip.as_deref())
+                        .authorize(token, client_ip.as_deref(), remaining_path)
                         .map_err(Error::from)?;
 
                     // Rewrite the URI: strip the /_token_ prefix and reconstruct the
@@ -198,8 +200,8 @@ where
             let query_params = AuthMiddleware::extract_query_params(&query_string);
 
             // Check for query-param token (?token=...)
-            // Successful decryption proves knowledge of api_password — the AES key is
-            // derived from it, so a wrong key yields a padding error or non-JSON garbage.
+            // Tokens are AES-GCM sealed with a key derived from api_password, so
+            // one that opens was minted by this server and hasn't been modified.
             if let Some(token) = query_params.get("token").and_then(|v| v.as_str()) {
                 if let Some(handler) = encryption_handler {
                     let client_ip = req
@@ -207,7 +209,7 @@ where
                         .realip_remote_addr()
                         .map(|s| s.to_string());
                     let proxy_data = handler
-                        .decrypt(token, client_ip.as_deref())
+                        .authorize(token, client_ip.as_deref(), req.path())
                         .map_err(Error::from)?;
 
                     // Rewrite the query string: replace ?token=... with the decrypted params
@@ -275,6 +277,7 @@ fn build_proxy_data_from_query(query_params: &serde_json::Map<String, Value>) ->
         response_headers: Some(Value::Object(response_headers)),
         exp: None,
         ip: None,
+        endpoint: None,
     }
 }
 

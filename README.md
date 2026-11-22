@@ -15,8 +15,17 @@ proxy Stremio streams through MediaFlow, plus a password-protected usage dashboa
 | `GET` | `/health` | Health checks |
 | `GET` | `/` | Usage dashboard (sign-in page without a session) |
 
-Auth is unchanged from MediaFlow: `?api_password=…`, an encrypted `?token=…`, or a
-`/_token_…/` path prefix. `/generate_urls` reads `api_password` from its JSON body.
+Auth: `?api_password=…`, an encrypted `?token=…`, or a `/_token_…/` path prefix.
+`/generate_urls` reads `api_password` from its JSON body.
+
+Encrypted URLs are sealed with AES-256-GCM (key derived from the API password with
+HKDF-SHA256), so a token that wasn't minted by this server, or was modified, is
+refused. Each token only works on the endpoint it was generated for
+(`/proxy/stream`). Every
+rejected token gets the same `401 {"error":"Invalid or expired token"}`.
+These tokens are not interchangeable with the Python MediaFlow Proxy's AES-CBC
+tokens: URLs generated before upgrading stop working, and AIOStreams simply
+generates new ones.
 
 Everything else from upstream is gone: HLS and DASH/MPD proxying, ClearKey DRM, the
 video extractors, Telegram, Acestream, Xtream Codes, EPG proxy, `/proxy/forward`,

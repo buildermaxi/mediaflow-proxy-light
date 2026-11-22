@@ -221,11 +221,8 @@ mod tests {
             .unwrap()
             .encrypt(&ProxyData {
                 destination: "https://example.com/dl/abc".into(),
-                query_params: None,
-                request_headers: None,
-                response_headers: None,
-                exp: None,
-                ip: None,
+                endpoint: Some("/proxy/stream".into()),
+                ..Default::default()
             })
             .unwrap();
 
