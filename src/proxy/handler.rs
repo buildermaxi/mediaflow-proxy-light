@@ -6,47 +6,34 @@ use actix_web::{
 use futures::stream;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::boxed::Box;
-use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::{
-    auth::{
-        encryption::{unix_now, ProxyData},
-        EncryptionHandler,
-    },
-    config::{Config, ForwardConfig},
+    auth::encryption::ProxyData,
+    config::ForwardConfig,
     error::{AppError, AppResult},
     models::request::{SUPPORTED_REQUEST_HEADERS, SUPPORTED_RESPONSE_HEADERS},
     proxy::stream::{ResponseStream, StreamManager},
-    utils::{
-        base64_url::{decode_base64_url, encode_url_to_base64},
-        client_ip::parse_ip,
-    },
 };
 
+/// Streams `proxy_data.destination` back to the client: the player's
+/// `Range` / `If-Range` go upstream, the upstream status (200, 206…) and a
+/// fixed set of response headers come back.
 async fn handle_proxy_request(
     req: HttpRequest,
     stream_manager: web::Data<StreamManager>,
     proxy_data: web::ReqData<ProxyData>,
     is_head: bool,
-    destination_override: Option<String>,
 ) -> AppResult<HttpResponse> {
-    let destination = destination_override
-        .filter(|d| !d.is_empty())
-        .unwrap_or_else(|| proxy_data.destination.clone());
-
+    let destination = proxy_data.destination.clone();
     if destination.is_empty() {
-        return Err(AppError::BadRequest(
-            "Missing destination URL. Provide `d=<url>` query param or an encrypted token.".into(),
-        ));
+        return Err(AppError::BadRequest("Missing destination URL".into()));
     }
 
-    // Prepare headers
+    // Only the player's seek headers are forwarded.
     let mut request_headers = HeaderMap::new();
-
-    // Add supported headers from original request
     for &header_name in SUPPORTED_REQUEST_HEADERS {
         if let Some(value) = req.headers().get(header_name) {
             request_headers.insert(
@@ -55,23 +42,6 @@ async fn handle_proxy_request(
                 HeaderValue::try_from(value.as_bytes())
                     .map_err(|e| AppError::Internal(format!("Invalid header value: {}", e)))?,
             );
-        }
-    }
-
-    // Add custom headers from proxy data
-    if let Some(custom_headers) = &proxy_data.request_headers {
-        for (key, value) in custom_headers
-            .as_object()
-            .unwrap_or(&serde_json::Map::new())
-        {
-            if let Some(value_str) = value.as_str() {
-                request_headers.insert(
-                    HeaderName::from_str(key)
-                        .map_err(|e| AppError::Internal(format!("Invalid header name: {}", e)))?,
-                    HeaderValue::from_str(value_str)
-                        .map_err(|e| AppError::Internal(format!("Invalid header value: {}", e)))?,
-                );
-            }
         }
     }
 
@@ -112,23 +82,6 @@ async fn handle_proxy_request(
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
 
-    // Add custom response headers from proxy data
-    if let Some(custom_headers) = &proxy_data.response_headers {
-        for (key, value) in custom_headers
-            .as_object()
-            .unwrap_or(&serde_json::Map::new())
-        {
-            if let Some(value_str) = value.as_str() {
-                response.insert_header((
-                    actix_web::http::header::HeaderName::from_str(key)
-                        .map_err(|e| AppError::Internal(format!("Invalid header name: {}", e)))?,
-                    actix_web::http::header::HeaderValue::from_str(value_str)
-                        .map_err(|e| AppError::Internal(format!("Invalid header value: {}", e)))?,
-                ));
-            }
-        }
-    }
-
     if is_head {
         let empty_stream = Box::pin(stream::empty::<Result<Bytes, std::io::Error>>());
         Ok(response
@@ -148,39 +101,15 @@ async fn handle_proxy_request(
     }
 }
 
-/// Resolve the effective destination URL for a proxy stream request.
-///
-/// Priority:
-/// 1. `proxy_data.destination` (from encrypted token or `d=` query param) — used as-is.
-/// 2. `d=` query param is a base64url-encoded URL — decode and use it.
-/// 3. `{filename}` path segment is a base64url-encoded URL — decode and use it.
-fn resolve_stream_destination(req: &HttpRequest, proxy_data: &ProxyData) -> Option<String> {
-    // Already set by token or plain d= param.
-    if !proxy_data.destination.is_empty() {
-        // The destination might itself be a base64-encoded URL (Aiostreams passes d=<b64>).
-        let decoded = decode_base64_url(&proxy_data.destination);
-        return Some(decoded.unwrap_or_else(|| proxy_data.destination.clone()));
-    }
-
-    // Try the {filename:.*} path segment as a base64url-encoded destination URL.
-    if let Some(filename) = req.match_info().get("filename") {
-        if !filename.is_empty() {
-            if let Some(decoded) = decode_base64_url(filename) {
-                return Some(decoded);
-            }
-        }
-    }
-
-    None
-}
-
+/// `GET /proxy/stream[/<filename>]`, reached through a `/_token_…/` URL: the
+/// destination comes from the token (the filename segment is cosmetic, for
+/// players that show or sniff it).
 pub async fn proxy_stream_get(
     req: HttpRequest,
     stream_manager: web::Data<StreamManager>,
     proxy_data: web::ReqData<ProxyData>,
 ) -> AppResult<HttpResponse> {
-    let destination = resolve_stream_destination(&req, &proxy_data);
-    handle_proxy_request(req, stream_manager, proxy_data, false, destination).await
+    handle_proxy_request(req, stream_manager, proxy_data, false).await
 }
 
 pub async fn proxy_stream_head(
@@ -188,191 +117,32 @@ pub async fn proxy_stream_head(
     stream_manager: web::Data<StreamManager>,
     proxy_data: web::ReqData<ProxyData>,
 ) -> AppResult<HttpResponse> {
-    let destination = resolve_stream_destination(&req, &proxy_data);
-    handle_proxy_request(req, stream_manager, proxy_data, true, destination).await
+    handle_proxy_request(req, stream_manager, proxy_data, true).await
 }
 
-/// URL-building logic behind `POST /generate_urls`.
-///
-/// Encrypted tokens use Python's path format: `{base}/_token_{token}{endpoint_path}`.
-/// The token is bound to `endpoint`, so encrypted URLs require one.
-/// Unencrypted tokens use flat query params matching Python's encode_mediaflow_proxy_url.
-/// When `base64_encode_destination` is true and no `api_password` is provided, the
-/// destination URL is base64url-encoded and embedded in the URL path instead of `d=`.
-#[allow(clippy::too_many_arguments)]
-pub fn build_proxy_url(
-    mediaflow_proxy_url: &str,
-    endpoint: Option<&str>,
-    destination_url: &str,
-    query_params: &HashMap<String, String>,
-    request_headers: &HashMap<String, String>,
-    response_headers: &HashMap<String, String>,
-    propagate_response_headers: &HashMap<String, String>,
-    remove_response_headers: &[String],
-    stream_transformer: Option<&str>,
-    filename: Option<&str>,
-    api_password: Option<&str>,
-    expiration: Option<u64>,
-    ip: Option<&str>,
-    base64_encode_destination: bool,
-) -> AppResult<String> {
-    let base = mediaflow_proxy_url.trim_end_matches('/');
-    let endpoint_path = endpoint
-        .map(|ep| ep.trim_matches('/'))
-        .filter(|ep| !ep.is_empty())
-        .map(|ep| format!("/{ep}"))
-        .unwrap_or_default();
+// ---------------------------------------------------------------------------
+// Public IP
+// ---------------------------------------------------------------------------
 
-    if let Some(password) = api_password.filter(|p| !p.is_empty()) {
-        // Refuse what would only produce a token the server then rejects.
-        if endpoint_path.is_empty() {
-            return Err(AppError::BadRequest(
-                "`endpoint` is required for encrypted URLs".to_string(),
-            ));
-        }
-        if destination_url.is_empty() {
-            return Err(AppError::BadRequest(
-                "`destination_url` is required for encrypted URLs".to_string(),
-            ));
-        }
-        let ip = ip.filter(|ip| !ip.is_empty());
-        if ip.is_some_and(|ip| parse_ip(ip).is_none()) {
-            return Err(AppError::BadRequest(
-                "`ip` is not a valid IP address".to_string(),
-            ));
-        }
-        let handler = EncryptionHandler::new(password.as_bytes()).map_err(|e| {
-            AppError::Internal(format!("Failed to create encryption handler: {}", e))
-        })?;
-
-        let proxy_data = ProxyData {
-            destination: destination_url.to_string(),
-            query_params: Some(
-                serde_json::to_value(query_params).map_err(AppError::SerdeJsonError)?,
-            ),
-            request_headers: Some(
-                serde_json::to_value(request_headers).map_err(AppError::SerdeJsonError)?,
-            ),
-            response_headers: Some(
-                serde_json::to_value(response_headers).map_err(AppError::SerdeJsonError)?,
-            ),
-            exp: expiration.map(|e| unix_now().saturating_add(e)),
-            ip: ip.map(|s| s.to_string()),
-            endpoint: Some(endpoint_path.clone()),
-        };
-
-        let token = handler.encrypt(&proxy_data)?;
-
-        // Preserve the complete externally visible proxy base URL, including
-        // path prefixes used by reverse proxies/CDNs.
-        let mut url = format!("{}/_token_{}{}", base, token, endpoint_path);
-        if let Some(fname) = filename {
-            url = format!("{}/{}", url, urlencoding::encode(fname));
-        }
-        Ok(url)
-    } else {
-        // Unencrypted: flat query params matching Python's encode_mediaflow_proxy_url.
-        // When base64_encode_destination is set, embed the destination as base64url in the
-        // URL path (after the endpoint) instead of using a `d=` query parameter. This lets
-        // clients like Aiostreams construct proxy URLs without query-string bookkeeping.
-        let mut url = format!("{}{}", base, endpoint_path);
-
-        let mut params: Vec<(String, String)> = if base64_encode_destination {
-            // Destination goes into the path; no d= param.
-            let b64 = encode_url_to_base64(destination_url);
-            url = format!("{}/{}", url, b64);
-            vec![]
-        } else {
-            // Standard: append filename (if any) then add d= query param.
-            if let Some(fname) = filename {
-                url = format!("{}/{}", url, urlencoding::encode(fname));
-            }
-            vec![("d".to_string(), destination_url.to_string())]
-        };
-
-        for (k, v) in query_params {
-            if !v.is_empty() {
-                params.push((k.clone(), v.clone()));
-            }
-        }
-
-        for (k, v) in request_headers {
-            if v.is_empty() {
-                continue;
-            }
-            // Skip per-request dynamic headers (range, if-range) — baking them into
-            // the URL would override the player's actual seek headers on playback.
-            let k_lower = k.to_lowercase();
-            let bare = k_lower.strip_prefix("h_").unwrap_or(&k_lower);
-            if SUPPORTED_REQUEST_HEADERS.contains(&bare) {
-                continue;
-            }
-            let prefixed = if k.starts_with("h_") {
-                k.clone()
-            } else {
-                format!("h_{}", k)
-            };
-            params.push((prefixed, v.clone()));
-        }
-
-        for (k, v) in response_headers {
-            if v.is_empty() {
-                continue;
-            }
-            let prefixed = if k.starts_with("r_") {
-                k.clone()
-            } else {
-                format!("r_{}", k)
-            };
-            params.push((prefixed, v.clone()));
-        }
-
-        for (k, v) in propagate_response_headers {
-            if v.is_empty() {
-                continue;
-            }
-            let prefixed = if k.starts_with("rp_") {
-                k.clone()
-            } else {
-                format!("rp_{}", k)
-            };
-            params.push((prefixed, v.clone()));
-        }
-
-        if !remove_response_headers.is_empty() {
-            params.push(("x_headers".to_string(), remove_response_headers.join(",")));
-        }
-
-        if let Some(transformer) = stream_transformer {
-            params.push(("transformer".to_string(), transformer.to_string()));
-        }
-
-        if params.is_empty() {
-            Ok(url)
-        } else {
-            let qs = params
-                .iter()
-                .map(|(k, v)| format!("{}={}", k, urlencoding::encode(v)))
-                .collect::<Vec<_>>()
-                .join("&");
-            Ok(format!("{}?{}", url, qs))
-        }
-    }
-}
-
-// Mirrors Python's IP_LOOKUP_SERVICES — tried in order; first success wins.
-// Looked up through `StreamManager` on every call, so the answer is the IP the
-// streams actually leave from (e.g. a WARP / SOCKS upstream proxy), which is
-// what AIOStreams binds debrid links to. AIOStreams caches it on its side.
+// Tried in order; first IPv4 answer wins. Looked up on every call, so the
+// answer is the IP the streams actually leave from: the one AIO Reborn binds
+// debrid links to (it caches it on its side). Debrid services are reached
+// over IPv4, so an IPv6 answer is skipped.
 const IP_LOOKUP_SERVICES: &[(&str, &str)] = &[
     ("https://api.ipify.org?format=json", "ip"),
     ("https://ipinfo.io/json", "ip"),
     ("https://httpbin.org/ip", "origin"),
 ];
 
-/// Per-service cap, so a stalled proxy (e.g. WARP up but its tunnel dead)
-/// fails all three lookups well within AIOStreams' 30 s request timeout.
+/// Per-service cap, so a stalled lookup fails all three well within the
+/// caller's own timeout.
 const IP_LOOKUP_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// The IPv4 address in a lookup answer (`httpbin` may list several,
+/// comma-separated: the first one is the client).
+fn ipv4_of(answer: &str) -> Option<Ipv4Addr> {
+    answer.split(',').next()?.trim().parse().ok()
+}
 
 pub async fn get_public_ip(
     stream_manager: web::Data<StreamManager>,
@@ -392,13 +162,11 @@ pub async fn get_public_ip(
         };
         match tokio::time::timeout(IP_LOOKUP_TIMEOUT, lookup).await {
             Ok(Ok(data)) => {
-                if let Some(ip) = data.get(*key).and_then(|v| v.as_str()) {
-                    let ip = ip.trim();
-                    if !ip.is_empty() {
-                        return Ok(HttpResponse::Ok().json(serde_json::json!({ "ip": ip })));
-                    }
+                let answer = data.get(*key).and_then(|v| v.as_str()).unwrap_or_default();
+                if let Some(ip) = ipv4_of(answer) {
+                    return Ok(HttpResponse::Ok().json(serde_json::json!({ "ip": ip.to_string() })));
                 }
-                tracing::warn!("IP lookup {} returned no '{}' field", url, key);
+                tracing::warn!("IP lookup {} returned no IPv4 '{}' field", url, key);
             }
             Ok(Err(e)) => tracing::warn!("IP lookup {} failed: {}", url, e),
             Err(_) => tracing::warn!(
@@ -414,254 +182,21 @@ pub async fn get_public_ip(
     ))
 }
 
-// ---------------------------------------------------------------------------
-// Multiple-URL generation
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, serde::Deserialize)]
-pub struct MultiUrlRequestItem {
-    pub endpoint: Option<String>,
-    pub destination_url: String,
-    #[serde(default)]
-    pub query_params: HashMap<String, String>,
-    #[serde(default)]
-    pub request_headers: HashMap<String, String>,
-    #[serde(default)]
-    pub response_headers: HashMap<String, String>,
-    #[serde(default)]
-    pub propagate_response_headers: HashMap<String, String>,
-    #[serde(default)]
-    pub remove_response_headers: Vec<String>,
-    pub stream_transformer: Option<String>,
-    pub filename: Option<String>,
-    #[serde(default)]
-    pub base64_encode_destination: bool,
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct GenerateMultiUrlRequest {
-    pub mediaflow_proxy_url: String,
-    pub api_password: Option<String>,
-    pub expiration: Option<u64>,
-    pub ip: Option<String>,
-    pub urls: Vec<MultiUrlRequestItem>,
-}
-
-/// Lifetime (seconds) to give a token: the requested `expiration`, capped by
-/// the server's `token_ttl`, which also applies when none is requested.
-/// `0` means "no limit" for either value.
-pub fn effective_expiration(requested: Option<u64>, token_ttl: u64) -> Option<u64> {
-    match (requested.filter(|&r| r > 0), token_ttl) {
-        (None, 0) => None,
-        (None, ttl) => Some(ttl),
-        (Some(requested), 0) => Some(requested),
-        (Some(requested), ttl) => Some(requested.min(ttl)),
-    }
-}
-
-pub async fn generate_urls(
-    req: web::Json<GenerateMultiUrlRequest>,
-    config: web::Data<Arc<Config>>,
-) -> AppResult<HttpResponse> {
-    let effective_password = req.api_password.as_deref().filter(|p| !p.is_empty());
-    let expiration = effective_expiration(req.expiration, config.auth.token_ttl);
-    let mut encoded: Vec<String> = Vec::with_capacity(req.urls.len());
-
-    for item in &req.urls {
-        let url = build_proxy_url(
-            &req.mediaflow_proxy_url,
-            item.endpoint.as_deref(),
-            &item.destination_url,
-            &item.query_params,
-            &item.request_headers,
-            &item.response_headers,
-            &item.propagate_response_headers,
-            &item.remove_response_headers,
-            item.stream_transformer.as_deref(),
-            item.filename.as_deref(),
-            effective_password,
-            expiration,
-            req.ip.as_deref(),
-            item.base64_encode_destination,
-        )?;
-        encoded.push(url);
-    }
-
-    Ok(HttpResponse::Ok().json(serde_json::json!({ "urls": encoded })))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, ForwardConfig};
+    use crate::config::Config;
     use actix_web::{test, App};
-    use std::sync::{Arc, Mutex};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-
-    /// The IP lookup must leave through the same upstream proxy as the streams,
-    /// or AIOStreams binds debrid links to an IP that never fetches them.
-    #[actix_web::test]
-    async fn public_ip_lookup_goes_through_the_upstream_proxy() {
-        // Fake HTTP proxy: records each request line and refuses the tunnel.
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_url = format!("http://{}", listener.local_addr().unwrap());
-        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
-        let log = Arc::clone(&seen);
-        tokio::spawn(async move {
-            while let Ok((mut socket, _)) = listener.accept().await {
-                let mut buf = [0u8; 1024];
-                let n = socket.read(&mut buf).await.unwrap_or(0);
-                let line = String::from_utf8_lossy(&buf[..n]);
-                log.lock()
-                    .unwrap()
-                    .push(line.lines().next().unwrap_or_default().to_string());
-                let _ = socket
-                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n")
-                    .await;
-            }
-        });
-
-        let mut config = Config::from_env().expect("default config");
-        config.proxy.proxy_url = Some(proxy_url);
-        config.proxy.all_proxy = true;
-        let app = test::init_service(
-            App::new()
-                .app_data(web::Data::new(StreamManager::new(config.proxy.clone())))
-                .app_data(web::Data::new(ForwardConfig::default()))
-                .route("/proxy/ip", web::get().to(get_public_ip)),
-        )
-        .await;
-
-        let res =
-            test::call_service(&app, test::TestRequest::get().uri("/proxy/ip").to_request()).await;
-        assert!(
-            res.status().is_server_error(),
-            "the fake proxy refuses every tunnel"
-        );
-        let seen = seen.lock().unwrap().clone();
-        assert_eq!(
-            seen.first().map(String::as_str),
-            Some("CONNECT api.ipify.org:443 HTTP/1.1"),
-            "lookup must go through the proxy: {seen:?}"
-        );
-    }
 
     #[actix_web::test]
-    async fn token_lifetime_defaults_to_and_is_capped_by_token_ttl() {
-        let ttl = 172_800;
+    async fn only_ipv4_answers_are_used() {
+        assert_eq!(ipv4_of("82.66.1.2"), Some(Ipv4Addr::new(82, 66, 1, 2)));
         assert_eq!(
-            effective_expiration(None, ttl),
-            Some(ttl),
-            "default applies"
+            ipv4_of(" 82.66.1.2, 10.0.0.1"),
+            Some(Ipv4Addr::new(82, 66, 1, 2))
         );
-        assert_eq!(
-            effective_expiration(Some(0), ttl),
-            Some(ttl),
-            "0 = not requested"
-        );
-        assert_eq!(
-            effective_expiration(Some(3600), ttl),
-            Some(3600),
-            "shorter kept"
-        );
-        assert_eq!(
-            effective_expiration(Some(ttl * 10), ttl),
-            Some(ttl),
-            "longer capped"
-        );
-        assert_eq!(effective_expiration(None, 0), None, "ttl 0 = no default");
-        assert_eq!(effective_expiration(Some(3600), 0), Some(3600));
-    }
-
-    /// Calls `/generate_urls` with `token_ttl` configured and `body` as the
-    /// request; returns the status and the JSON body.
-    async fn generate(token_ttl: u64, body: serde_json::Value) -> (u16, serde_json::Value) {
-        let mut config = Config::from_env().expect("default config");
-        config.auth.token_ttl = token_ttl;
-        let app = test::init_service(
-            App::new()
-                .app_data(web::Data::new(Arc::new(config)))
-                .route("/generate_urls", web::post().to(generate_urls)),
-        )
-        .await;
-        let req = test::TestRequest::post()
-            .uri("/generate_urls")
-            .set_json(body)
-            .to_request();
-        let resp = match test::try_call_service(&app, req).await {
-            Ok(resp) => resp.into_parts().1,
-            Err(err) => err.error_response(),
-        };
-        let status = resp.status().as_u16();
-        let bytes = actix_web::body::to_bytes(resp.into_body())
-            .await
-            .unwrap_or_default();
-        (status, serde_json::from_slice(&bytes).unwrap_or_default())
-    }
-
-    fn stream_request(expiration: Option<u64>) -> serde_json::Value {
-        serde_json::json!({
-            "mediaflow_proxy_url": "https://proxy.example.com",
-            "api_password": "s3cret",
-            "expiration": expiration,
-            "urls": [{
-                "endpoint": "/proxy/stream",
-                "destination_url": "https://cdn.example.com/movie.mkv",
-                "filename": "movie.mkv"
-            }]
-        })
-    }
-
-    /// Expiry (`exp`) of the single URL in a `/generate_urls` response.
-    fn exp_of(body: &serde_json::Value) -> Option<u64> {
-        let url = body["urls"][0].as_str().expect("one url");
-        let token = url
-            .split_once("/_token_")
-            .and_then(|(_, rest)| rest.split('/').next())
-            .expect("token in url");
-        EncryptionHandler::new(b"s3cret")
-            .unwrap()
-            .decrypt(token, None)
-            .unwrap()
-            .exp
-    }
-
-    /// `/generate_urls` gives encrypted URLs the server's default lifetime
-    /// when the caller (AIOStreams) doesn't ask for one, and caps longer ones.
-    #[actix_web::test]
-    async fn generate_urls_applies_and_caps_the_token_ttl() {
-        for (ttl, requested, lifetime) in [
-            (600, None, Some(600)),
-            (600, Some(60), Some(60)),
-            (600, Some(86_400), Some(600)),
-            (0, None, None),
-            (0, Some(60), Some(60)),
-        ] {
-            let before = unix_now();
-            let (status, body) = generate(ttl, stream_request(requested)).await;
-            let after = unix_now();
-            assert_eq!(status, 200, "{body}");
-            let exp = exp_of(&body);
-            match lifetime {
-                None => assert_eq!(exp, None, "ttl {ttl} requested {requested:?}"),
-                Some(lifetime) => {
-                    let exp = exp.expect("expiry set");
-                    assert!(
-                        (before + lifetime..=after + lifetime).contains(&exp),
-                        "ttl {ttl} requested {requested:?}: exp {exp}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[actix_web::test]
-    async fn generate_urls_refuses_an_encrypted_url_without_endpoint() {
-        let mut body = stream_request(None);
-        body["urls"][0]["endpoint"] = serde_json::Value::Null;
-        let (status, body) = generate(600, body).await;
-        assert_eq!(status, 400, "{body}");
+        assert_eq!(ipv4_of("2a01:e0a::1"), None);
+        assert_eq!(ipv4_of(""), None);
     }
 
     #[actix_web::test]

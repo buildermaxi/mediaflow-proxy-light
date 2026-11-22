@@ -13,7 +13,7 @@ fn setup() -> MutexGuard<'static, ()> {
     env::remove_var("APP__AUTH__API_PASSWORD");
     env::remove_var("APP__AUTH__TOKEN_TTL");
     env::remove_var("APP__PROXY__CONNECT_TIMEOUT");
-    env::remove_var("APP__PROXY__TRANSPORT_ROUTES");
+    env::remove_var("API_PASSWORD");
     env::remove_var("CONFIG_PATH");
     guard
 }
@@ -48,46 +48,23 @@ fn token_ttl_defaults_to_48_hours_and_reads_env() {
 }
 
 #[test]
-fn test_transport_routes_config() {
+fn api_password_has_no_default() {
     let _guard = setup();
+    // `main` refuses to start with an empty password.
+    assert_eq!(Config::from_env().unwrap().auth.api_password, "");
+}
 
-    // Modify the JSON string to be a single line with escaped quotes
-    let routes_json = r#"{"all://*.streaming.com":{"proxy":true,"proxy_url":"socks5://test-proxy:1080","verify_ssl":true}}"#;
-
-    env::set_var("APP__PROXY__TRANSPORT_ROUTES", routes_json);
-
-    let config = Config::from_env().unwrap();
-
-    // Add debug prints to help diagnose the issue
-    println!(
-        "Environment variable value: {}",
-        env::var("APP__PROXY__TRANSPORT_ROUTES").unwrap_or_default()
-    );
-    println!("Parsed routes: {:?}", config.proxy.transport_routes);
-
-    let routes = config.proxy.transport_routes;
-
-    // Test route configuration
-    assert!(
-        routes.contains_key("all://*.streaming.com"),
-        "Expected key 'all://*.streaming.com' not found in routes"
-    );
-
-    let route = routes
-        .get("all://*.streaming.com")
-        .expect("Route should exist");
-
-    assert!(route.proxy, "Proxy should be enabled");
-    assert_eq!(
-        route.proxy_url.as_deref(),
-        Some("socks5://test-proxy:1080"),
-        "Proxy URL doesn't match"
-    );
-    assert!(route.verify_ssl, "SSL verification should be enabled");
+/// The Python proxy's flat variables are no longer read: only `APP__*`.
+#[test]
+fn flat_python_variables_are_ignored() {
+    let _guard = setup();
+    env::set_var("API_PASSWORD", "flat");
+    assert_eq!(Config::from_env().unwrap().auth.api_password, "");
+    env::remove_var("API_PASSWORD");
 }
 
 #[test]
-fn test_transport_routes_from_toml() {
+fn reads_a_toml_file() {
     let _guard = setup();
 
     let config_content = r#"
@@ -97,50 +74,25 @@ port = 8888
 
 [auth]
 api_password = "test_password"
+token_ttl = 600
 
 [proxy]
 connect_timeout = 12
-
-[proxy.transport_routes."all://*.streaming.com"]
-proxy = true
-proxy_url = "socks5://test-proxy:1080"
-verify_ssl = true
 "#;
 
-    // Create a temporary directory for our test
     let temp_dir = tempfile::tempdir().expect("Failed to create temp directory");
     let config_path = temp_dir.path().join("config.toml");
-
-    // Write the config file
     fs::write(&config_path, config_content).expect("Failed to write config");
-
-    // Set the config path environment variable
     env::set_var("CONFIG_PATH", config_path.to_str().unwrap());
 
     let config = Config::from_env().unwrap();
+    env::remove_var("CONFIG_PATH");
 
-    println!(
-        "Parsed routes from TOML: {:?}",
-        config.proxy.transport_routes
-    );
-
-    let routes = config.proxy.transport_routes;
-
-    // Test route configuration
+    assert_eq!(config.auth.api_password, "test_password");
+    assert_eq!(config.auth.token_ttl, 600);
+    assert_eq!(config.proxy.connect_timeout, 12);
     assert!(
-        routes.contains_key("all://*.streaming.com"),
-        "Expected key 'all://*.streaming.com' not found in routes"
+        config.proxy.follow_redirects,
+        "redirects followed by default"
     );
-
-    let route = routes
-        .get("all://*.streaming.com")
-        .expect("Route should exist");
-
-    assert!(route.proxy, "Proxy should be enabled");
-    assert_eq!(
-        route.proxy_url.as_deref(),
-        Some("socks5://test-proxy:1080"),
-        "Proxy URL doesn't match"
-    );
-    assert!(route.verify_ssl, "SSL verification should be enabled");
 }

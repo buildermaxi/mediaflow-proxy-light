@@ -9,9 +9,9 @@ workers = 4  # Number of worker threads
 
 [proxy]
 connect_timeout = 30    # TCP handshake timeout (seconds)
-follow_redirects = true
-proxy_url = ""          # Default proxy URL (supports http/https/socks4/socks5)
-all_proxy = false       # If true, route all traffic through proxy_url
+follow_redirects = true # Addon playback links usually redirect to the debrid download
+# Upstream requests always go out directly: no upstream proxy, and the
+# HTTP(S)_PROXY / ALL_PROXY environment variables are ignored.
 
 # ── Upstream tunables (all optional — defaults shown) ─────────────────────────
 #
@@ -37,18 +37,12 @@ pool_idle_timeout = 90
 pool_max_idle_per_host = 100
 # Maximum idle upstream connections retained per host.
 
-# Per-URL transport route overrides
-[proxy.transport_routes]
-"all://*.streaming.com"    = { proxy = true,  proxy_url = "socks5://streaming-proxy:1080", verify_ssl = true }
-"all://*.internal.com"     = { proxy = false, verify_ssl = true }
-"https://api.service.com"  = { proxy = true,  verify_ssl = false }
-
 [auth]
-api_password = "your-password"  # Replace with a strong secret key (also unlocks the dashboard at /)
-token_ttl = 172800              # Max lifetime of encrypted URLs, in seconds (0 = no default expiry, no cap)
+api_password = "your-password"  # Required. Same value as AIO Reborn's MEDIAFLOW_API_PASSWORD (also unlocks the dashboard at /)
+token_ttl = 172800              # Longest lifetime a stream token may have left, in seconds (0 = no cap)
 
 # ---------------------------------------------------------------------------
-# Public IP returned by GET /proxy/ip (AIOStreams binds debrid links to it)
+# Public IP returned by GET /proxy/ip (AIO Reborn binds debrid links to it)
 # ---------------------------------------------------------------------------
 [forward]
-# public_ip = "203.0.113.10"  # When unset, looked up through the upstream proxy on each call
+# public_ip = "203.0.113.10"  # When unset, looked up on each call (IPv4 only)

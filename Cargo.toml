@@ -1,32 +1,20 @@
 [package]
 name = "mediaflow-proxy-light"
-version = "1.2.1"
+version = "2.0.0"
 edition = "2021"
-
-# Ignore dependencies that cargo-machete flags but are legitimately behind
-# disabled feature flags (detected when those features aren't in `default`).
-[package.metadata.cargo-machete]
-ignored = ["openssl"]
 
 # ---------------------------------------------------------------------------
 # Features
 # ---------------------------------------------------------------------------
 [features]
-# The server keeps only what AIOStreams needs — `/proxy/ip`, `/generate_urls`,
-# `/proxy/stream` — plus the dashboard, so the only build choice left is the
-# TLS backend for `reqwest`. Exactly one must be enabled.
+# The server keeps only what AIO Reborn needs — `/proxy/stream` (through
+# `/_token_…/` URLs it mints) and `/proxy/ip` — plus the dashboard.
 #
-# `tls-rustls` (default) bundles Mozilla's CA list into the binary instead of
-# probing the host filesystem, so the distroless image needs no CA bundle.
-# `tls-native` uses the OS TLS stack (OpenSSL on Linux), which avoids rustls
-# JA3/JA4 fingerprint blocks on a few Akamai-protected CDNs.
+# `tls-rustls` (the only TLS backend) bundles Mozilla's CA list into the
+# binary instead of probing the host filesystem, so the distroless image
+# needs no CA bundle.
 default = ["tls-rustls"]
-tls-native = ["reqwest/native-tls"]
 tls-rustls = ["reqwest/rustls-tls-webpki-roots"]
-
-# Optional: vendored OpenSSL (only relevant when `tls-native` is used on
-# platforms without a system OpenSSL, e.g. some cross-compiles).
-vendored-openssl = ["openssl/vendored"]
 
 # ---------------------------------------------------------------------------
 # Lints
@@ -67,9 +55,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 futures = "0.3"
 
-# HTTP client — the TLS backend is selected by the `tls-native` /
-# `tls-rustls` feature flags (see [features] above).
-reqwest = { version = "0.12.28", default-features = false, features = ["stream", "json", "socks", "gzip", "deflate"] }
+# HTTP client — TLS through the `tls-rustls` feature (see [features] above).
+reqwest = { version = "0.12.28", default-features = false, features = ["stream", "json"] }
 
 # Crypto — AES-256-GCM (key from HKDF-SHA256) for proxy-URL tokens,
 # HMAC-SHA256 for the dashboard session
@@ -84,7 +71,6 @@ base64 = "0.22.1"
 hex = "0.4"
 url = "2.5"
 urlencoding = "2.1"
-regex = "1.12"
 thiserror = "2.0"
 
 # Configuration
@@ -96,9 +82,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Concurrency
 dashmap = "6"
-
-# Vendored OpenSSL (only needed for `tls-native` builds; prefer rustls)
-openssl = { version = "0.10", features = ["vendored"], optional = true }
 
 # Process CPU time (all unix) and RSS (macOS) for the web dashboard.
 [target.'cfg(unix)'.dependencies]

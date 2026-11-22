@@ -196,7 +196,7 @@ mod tests {
         let app = test::init_service(
             App::new()
                 .wrap(from_fn(traffic_meter))
-                .wrap(AuthMiddleware::new(PASSWORD.to_string()))
+                .wrap(AuthMiddleware::new(PASSWORD.to_string(), 0))
                 .app_data(web::Data::new(Arc::clone(&metrics)))
                 .route(
                     "/proxy/stream/{filename:.*}",

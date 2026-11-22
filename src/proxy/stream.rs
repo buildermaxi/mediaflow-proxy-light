@@ -1,7 +1,7 @@
 use actix_web::web::Bytes;
 use dashmap::DashMap;
 use futures::{Stream, StreamExt};
-use reqwest::{Client, Proxy, Response};
+use reqwest::{Client, Response};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
@@ -14,7 +14,7 @@ use tokio::time::{timeout, Duration};
 use tracing::error;
 
 use crate::{
-    config::{ProxyConfig, ProxyRouteConfig, ProxyRouter},
+    config::ProxyConfig,
     error::{AppError, AppResult},
     metrics::upstream::{ByteTally, UpstreamStats},
 };
@@ -123,21 +123,16 @@ impl Stream for UpstreamBody {
 
 #[derive(Clone)]
 pub struct StreamManager {
-    /// Client for upstream requests that match no transport route. Shared
-    /// by every request: all of them run on the upstream runtime, so its
-    /// connection pool and the tasks driving its connections live there.
-    default_client: Client,
-    /// Per-route client cache — keyed by a hash of the route config so we
-    /// never create more than one client per unique (proxy_url, verify_ssl)
-    /// combination, even under high concurrency.
-    route_clients: Arc<DashMap<String, Client>>,
+    /// Client for every upstream request. Shared by all of them: they run on
+    /// the upstream runtime, so its connection pool and the tasks driving its
+    /// connections live there.
+    client: Client,
     /// Per-host concurrency limiter — caps simultaneous in-flight upstream
     /// requests to the same origin.  Forces HTTP/1.1 keep-alive reuse when
     /// many requests target the same host, which dramatically reduces
     /// per-request latency for bursts to a single upstream.
     per_host_semaphores: Arc<DashMap<String, Arc<Semaphore>>>,
     config: Arc<ProxyConfig>,
-    proxy_router: Arc<ProxyRouter>,
     /// Per-host health for the dashboard; `None` when not wired up.
     upstream_stats: Option<Arc<UpstreamStats>>,
 }
@@ -147,15 +142,12 @@ impl StreamManager {
         // Start the upstream runtime now, so a failure to spawn its threads
         // stops the server at startup rather than on the first request.
         upstream_runtime();
-        let proxy_router = ProxyRouter::from_config(&config);
-        let default_client = Self::create_default_client(&config, &proxy_router);
+        let client = Self::create_client(&config);
 
         Self {
-            default_client,
-            route_clients: Arc::new(DashMap::new()),
+            client,
             per_host_semaphores: Arc::new(DashMap::new()),
             config: Arc::new(config),
-            proxy_router: Arc::new(proxy_router),
             upstream_stats: None,
         }
     }
@@ -205,15 +197,15 @@ impl StreamManager {
         Some(sem)
     }
 
-    /// Build the default shared client used when no transport route matches.
+    /// Build the shared upstream client.
     ///
     /// Connection pooling is ENABLED (up to 100 idle connections per host).
     /// This is the most important performance lever: re-using TCP connections
     /// eliminates per-request handshake latency and dramatically reduces
     /// overhead at high concurrency.
-    fn create_default_client(config: &ProxyConfig, proxy_router: &ProxyRouter) -> Client {
+    fn create_client(config: &ProxyConfig) -> Client {
         let follow_redirects = config.follow_redirects;
-        let mut builder = Client::builder()
+        Client::builder()
             // TCP connect timeout (handshake only — does NOT include pool-acquisition wait).
             .connect_timeout(Duration::from_secs(config.connect_timeout))
             // NO .timeout() here — a client-level timeout applies to the full request
@@ -236,62 +228,12 @@ impl StreamManager {
                 } else {
                     attempt.stop()
                 }
-            }));
-
-        if let Some(default_proxy) = proxy_router.default_proxy() {
-            if let Ok(proxy) = Proxy::all(default_proxy) {
-                builder = builder.proxy(proxy);
-            }
-        }
-
-        builder.build().expect("Failed to create HTTP client")
-    }
-
-    /// Build a client for a specific transport route config.
-    ///
-    /// Called at most once per unique route config (results are cached in
-    /// `self.route_clients`).  Never called in the common case where
-    /// `all_proxy = false` and no transport route patterns match.
-    fn build_route_client(
-        config: &ProxyConfig,
-        route_config: &ProxyRouteConfig,
-    ) -> AppResult<Client> {
-        let mut builder = Client::builder()
-            .connect_timeout(Duration::from_secs(config.connect_timeout))
-            // No client-level timeout — see create_default_client for rationale.
-            .pool_idle_timeout(Duration::from_secs(config.pool_idle_timeout))
-            .pool_max_idle_per_host(config.pool_max_idle_per_host)
-            .no_brotli()
-            .no_deflate()
-            .no_gzip()
-            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
-
-        if route_config.proxy {
-            if let Some(proxy_url) = route_config.proxy_url.as_ref() {
-                match Proxy::all(proxy_url) {
-                    Ok(proxy) => {
-                        tracing::info!("Building route client with proxy {}", proxy_url);
-                        builder = builder.proxy(proxy);
-                    }
-                    Err(e) => {
-                        error!("Failed to create proxy for route: {}", e);
-                        return Err(AppError::Internal(format!(
-                            "Failed to create route proxy client: {}",
-                            e
-                        )));
-                    }
-                }
-            }
-        }
-
-        if !route_config.verify_ssl {
-            tracing::warn!("SSL verification disabled for route");
-            builder = builder.danger_accept_invalid_certs(true);
-        }
-
-        builder
+            }))
+            // Always connect directly, ignoring HTTP(S)_PROXY / ALL_PROXY in the
+            // environment: the debrid service must only ever see this host's IP.
+            .no_proxy()
             .build()
-            .map_err(|e| AppError::Internal(format!("Failed to build route client: {}", e)))
+            .expect("Failed to create HTTP client")
     }
 
     /// Extract the host (and port) from a URL for per-host limiting.
@@ -359,26 +301,7 @@ impl StreamManager {
         url: String,
         headers: reqwest::header::HeaderMap,
     ) -> AppResult<(Response, ByteTally)> {
-        let proxy_config = self.proxy_router.get_proxy_config(&url);
-
-        let client = if let Some(route_config) = proxy_config {
-            let cache_key = format!(
-                "{}|{}|{}",
-                route_config.proxy,
-                route_config.proxy_url.as_deref().unwrap_or(""),
-                route_config.verify_ssl,
-            );
-
-            if let Some(cached) = self.route_clients.get(&cache_key) {
-                cached.clone()
-            } else {
-                let new_client = Self::build_route_client(&self.config, &route_config)?;
-                self.route_clients.insert(cache_key, new_client.clone());
-                new_client
-            }
-        } else {
-            self.default_client.clone()
-        };
+        let client = self.client.clone();
 
         // Apply timeout only to the connection + response-headers phase.
         // Once send() resolves the header timeout has been satisfied; body
@@ -603,9 +526,6 @@ mod tests {
         StreamManager::new(ProxyConfig {
             connect_timeout: 5,
             follow_redirects: true,
-            proxy_url: None,
-            all_proxy: false,
-            transport_routes: Default::default(),
             request_timeout_factor: 8,
             max_concurrent_per_host,
             pool_idle_timeout: 90,

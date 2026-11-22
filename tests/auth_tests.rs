@@ -19,7 +19,7 @@ async fn test_encryption_handler() {
     };
 
     let token = handler.encrypt(&proxy_data).unwrap();
-    let decrypted = handler.decrypt(&token, None).unwrap();
+    let decrypted = handler.decrypt(&token).unwrap();
 
     assert_eq!(decrypted.destination, proxy_data.destination);
     assert_eq!(decrypted.exp, proxy_data.exp);
@@ -36,7 +36,7 @@ async fn test_token_expiration() {
     };
 
     let token = handler.encrypt(&proxy_data).unwrap();
-    let result = handler.decrypt(&token, None);
+    let result = handler.decrypt(&token);
 
     assert!(result.is_err());
 }
