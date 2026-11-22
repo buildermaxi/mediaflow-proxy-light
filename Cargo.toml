@@ -79,7 +79,8 @@ urlencoding = "2.1"
 thiserror = "2.0"
 
 # Configuration
-config = "0.15"
+# Environment variables and an optional TOML file only: no INI, JSON5, RON or YAML parsers.
+config = { version = "0.15", default-features = false, features = ["toml"] }
 
 # Logging
 tracing = "0.1"
