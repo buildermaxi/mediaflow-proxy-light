@@ -48,7 +48,12 @@ debug = false
 # Core dependencies
 # ---------------------------------------------------------------------------
 [dependencies]
-actix-web = "4.13"
+# No default features: the proxy streams already-compressed media and sits
+# behind a reverse proxy speaking HTTP/1.1, so request/response compression
+# (brotli, gzip, zstd), HTTP/2 and WebSockets are dead weight — and the code
+# where most actix-http advisories live. Kept: the macros, cookies for the
+# dashboard session, and unicode-aware routing.
+actix-web = { version = "4.13", default-features = false, features = ["macros", "cookies", "unicode"] }
 actix-cors = "0.7"
 tokio = { version = "1.51", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
