@@ -20,7 +20,10 @@ use crate::{
     error::{AppError, AppResult},
     models::request::{SUPPORTED_REQUEST_HEADERS, SUPPORTED_RESPONSE_HEADERS},
     proxy::stream::{ResponseStream, StreamManager},
-    utils::base64_url::{decode_base64_url, encode_url_to_base64},
+    utils::{
+        base64_url::{decode_base64_url, encode_url_to_base64},
+        client_ip::parse_ip,
+    },
 };
 
 async fn handle_proxy_request(
@@ -215,14 +218,27 @@ pub fn build_proxy_url(
 ) -> AppResult<String> {
     let base = mediaflow_proxy_url.trim_end_matches('/');
     let endpoint_path = endpoint
+        .map(|ep| ep.trim_matches('/'))
         .filter(|ep| !ep.is_empty())
-        .map(|ep| format!("/{}", ep.trim_start_matches('/')))
+        .map(|ep| format!("/{ep}"))
         .unwrap_or_default();
 
     if let Some(password) = api_password.filter(|p| !p.is_empty()) {
+        // Refuse what would only produce a token the server then rejects.
         if endpoint_path.is_empty() {
             return Err(AppError::BadRequest(
                 "`endpoint` is required for encrypted URLs".to_string(),
+            ));
+        }
+        if destination_url.is_empty() {
+            return Err(AppError::BadRequest(
+                "`destination_url` is required for encrypted URLs".to_string(),
+            ));
+        }
+        let ip = ip.filter(|ip| !ip.is_empty());
+        if ip.is_some_and(|ip| parse_ip(ip).is_none()) {
+            return Err(AppError::BadRequest(
+                "`ip` is not a valid IP address".to_string(),
             ));
         }
         let handler = EncryptionHandler::new(password.as_bytes()).map_err(|e| {
@@ -558,46 +574,94 @@ mod tests {
         assert_eq!(effective_expiration(Some(3600), 0), Some(3600));
     }
 
-    /// `/generate_urls` gives encrypted URLs the server's default lifetime
-    /// when the caller (AIOStreams) doesn't ask for one.
-    #[actix_web::test]
-    async fn generate_urls_applies_the_default_token_ttl() {
+    /// Calls `/generate_urls` with `token_ttl` configured and `body` as the
+    /// request; returns the status and the JSON body.
+    async fn generate(token_ttl: u64, body: serde_json::Value) -> (u16, serde_json::Value) {
         let mut config = Config::from_env().expect("default config");
-        config.auth.token_ttl = 600;
+        config.auth.token_ttl = token_ttl;
         let app = test::init_service(
             App::new()
                 .app_data(web::Data::new(Arc::new(config)))
                 .route("/generate_urls", web::post().to(generate_urls)),
         )
         .await;
-        let body: serde_json::Value = test::call_and_read_body_json(
-            &app,
-            test::TestRequest::post()
-                .uri("/generate_urls")
-                .set_json(serde_json::json!({
-                    "mediaflow_proxy_url": "https://proxy.example.com",
-                    "api_password": "s3cret",
-                    "urls": [{
-                        "endpoint": "/proxy/stream",
-                        "destination_url": "https://cdn.example.com/movie.mkv",
-                        "filename": "movie.mkv"
-                    }]
-                }))
-                .to_request(),
-        )
-        .await;
+        let req = test::TestRequest::post()
+            .uri("/generate_urls")
+            .set_json(body)
+            .to_request();
+        let resp = match test::try_call_service(&app, req).await {
+            Ok(resp) => resp.into_parts().1,
+            Err(err) => err.error_response(),
+        };
+        let status = resp.status().as_u16();
+        let bytes = actix_web::body::to_bytes(resp.into_body())
+            .await
+            .unwrap_or_default();
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    fn stream_request(expiration: Option<u64>) -> serde_json::Value {
+        serde_json::json!({
+            "mediaflow_proxy_url": "https://proxy.example.com",
+            "api_password": "s3cret",
+            "expiration": expiration,
+            "urls": [{
+                "endpoint": "/proxy/stream",
+                "destination_url": "https://cdn.example.com/movie.mkv",
+                "filename": "movie.mkv"
+            }]
+        })
+    }
+
+    /// Expiry (`exp`) of the single URL in a `/generate_urls` response.
+    fn exp_of(body: &serde_json::Value) -> Option<u64> {
         let url = body["urls"][0].as_str().expect("one url");
         let token = url
             .split_once("/_token_")
             .and_then(|(_, rest)| rest.split('/').next())
             .expect("token in url");
-        let data = EncryptionHandler::new(b"s3cret")
+        EncryptionHandler::new(b"s3cret")
             .unwrap()
             .decrypt(token, None)
-            .unwrap();
-        let exp = data.exp.expect("default expiry set");
-        let now = unix_now();
-        assert!(exp > now && exp <= now + 600, "exp {exp} vs now {now}");
+            .unwrap()
+            .exp
+    }
+
+    /// `/generate_urls` gives encrypted URLs the server's default lifetime
+    /// when the caller (AIOStreams) doesn't ask for one, and caps longer ones.
+    #[actix_web::test]
+    async fn generate_urls_applies_and_caps_the_token_ttl() {
+        for (ttl, requested, lifetime) in [
+            (600, None, Some(600)),
+            (600, Some(60), Some(60)),
+            (600, Some(86_400), Some(600)),
+            (0, None, None),
+            (0, Some(60), Some(60)),
+        ] {
+            let before = unix_now();
+            let (status, body) = generate(ttl, stream_request(requested)).await;
+            let after = unix_now();
+            assert_eq!(status, 200, "{body}");
+            let exp = exp_of(&body);
+            match lifetime {
+                None => assert_eq!(exp, None, "ttl {ttl} requested {requested:?}"),
+                Some(lifetime) => {
+                    let exp = exp.expect("expiry set");
+                    assert!(
+                        (before + lifetime..=after + lifetime).contains(&exp),
+                        "ttl {ttl} requested {requested:?}: exp {exp}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[actix_web::test]
+    async fn generate_urls_refuses_an_encrypted_url_without_endpoint() {
+        let mut body = stream_request(None);
+        body["urls"][0]["endpoint"] = serde_json::Value::Null;
+        let (status, body) = generate(600, body).await;
+        assert_eq!(status, 400, "{body}");
     }
 
     #[actix_web::test]

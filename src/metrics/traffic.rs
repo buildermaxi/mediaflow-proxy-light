@@ -5,7 +5,7 @@
 //! UI pages, health checks and the dashboard's own polling are not media
 //! routes and don't count as usage.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -21,6 +21,7 @@ use actix_web::{
 };
 
 use super::{clients::player_from_user_agent, AppMetrics, StreamKind};
+use crate::utils::client_ip::client_ip;
 
 /// Longest file name kept per client, in (percent-encoded) bytes: real
 /// release names stay well under it, but a crafted URL can't park a ~128 KB
@@ -73,20 +74,6 @@ fn stream_title(path: &str) -> Option<&str> {
         .strip_prefix("/proxy/stream/")
         .filter(|name| !name.is_empty())?;
     Some(&name[..name.floor_char_boundary(MAX_TITLE_LEN)])
-}
-
-/// Client address, honouring `Forwarded` / `X-Forwarded-For` so users behind
-/// a reverse proxy aren't all collapsed into the proxy's own IP.
-fn client_ip(req: &ServiceRequest) -> Option<IpAddr> {
-    let forwarded = req.connection_info().realip_remote_addr().and_then(|addr| {
-        addr.parse::<SocketAddr>()
-            .map(|a| a.ip())
-            .or_else(|_| addr.parse::<IpAddr>())
-            .ok()
-    });
-    forwarded
-        .or_else(|| req.peer_addr().map(|a| a.ip()))
-        .map(|ip| ip.to_canonical())
 }
 
 /// Response body that counts bytes as actix sends them, and keeps the stream

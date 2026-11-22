@@ -363,17 +363,35 @@ mod tests {
                 test::TestRequest::get()
                     .uri(&uri)
                     .cookie(cookie.clone())
+                    .insert_header((header::ORIGIN, "http://127.0.0.1:3000"))
                     .to_request(),
             )
             .await
             .err()
             .unwrap_or_else(|| panic!("{uri} must be refused"));
-            assert_eq!(
-                refused.error_response().status(),
-                StatusCode::UNAUTHORIZED,
-                "{uri}"
+            let refused = refused.error_response();
+            assert_eq!(refused.status(), StatusCode::UNAUTHORIZED, "{uri}");
+            assert!(
+                !refused
+                    .headers()
+                    .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    && !refused
+                        .headers()
+                        .contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS),
+                "{uri} must not be readable cross-origin"
             );
         }
+
+        // A token minted for the dashboard does pass the middleware, which
+        // rewrites `/_token_…/<path>`: that path stays out of CORS too.
+        let dashboard_token = EncryptionHandler::new(PASSWORD.as_bytes())
+            .unwrap()
+            .encrypt(&ProxyData {
+                destination: "https://example.com/movie.mkv".into(),
+                endpoint: Some("/dashboard".into()),
+                ..Default::default()
+            })
+            .unwrap();
 
         // A page on another port of the same host is "same-site", so the
         // browser sends the cookie; without CORS headers it can't read the
@@ -383,6 +401,8 @@ mod tests {
             "/dashboard/stats".to_string(),
             "/dashboard/history".to_string(),
             format!("/dashboard/%73tats?api_password={PASSWORD}"),
+            format!("/_token_{dashboard_token}/dashboard/stats"),
+            format!("/_token_{dashboard_token}/dashboard/%73tats"),
         ] {
             let res = test::call_service(
                 &app,

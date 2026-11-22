@@ -189,7 +189,7 @@ fn encrypted_url_token_is_bound_to_its_endpoint() {
 /// refused at generation time rather than handed out broken.
 #[test]
 fn encrypted_url_requires_an_endpoint() {
-    for endpoint in [None, Some("")] {
+    for endpoint in [None, Some(""), Some("/"), Some("///")] {
         let result = build_proxy_url(
             "https://proxy.example.com",
             endpoint,
@@ -208,6 +208,66 @@ fn encrypted_url_requires_an_endpoint() {
         );
         assert!(result.is_err(), "endpoint {endpoint:?} must be refused");
     }
+}
+
+/// Inputs that could only produce a token the server then refuses are
+/// rejected when generating the URL.
+#[test]
+fn encrypted_url_refuses_unusable_inputs() {
+    let build = |dest: &str, ip: Option<&str>| {
+        build_proxy_url(
+            "https://proxy.example.com",
+            Some("/proxy/stream"),
+            dest,
+            &default_headers(),
+            &default_headers(),
+            &default_headers(),
+            &default_headers(),
+            &[],
+            None,
+            None,
+            Some("test_secret"),
+            None,
+            ip,
+            false,
+        )
+    };
+    assert!(build("", None).is_err(), "empty destination");
+    assert!(
+        build("https://cdn.example.com/a.mkv", Some("nope")).is_err(),
+        "bad ip"
+    );
+    // An empty ip means "not bound".
+    let url = build("https://cdn.example.com/a.mkv", Some("")).unwrap();
+    let pd = handler()
+        .decrypt(extract_token_from_url(&url), None)
+        .unwrap();
+    assert_eq!(pd.ip, None);
+}
+
+/// A trailing slash on the endpoint doesn't produce `//` before the filename.
+#[test]
+fn encrypted_url_trailing_slash_endpoint() {
+    let url = build_proxy_url(
+        "https://proxy.example.com",
+        Some("/proxy/stream/"),
+        "https://cdn.example.com/movie.mkv",
+        &default_headers(),
+        &default_headers(),
+        &default_headers(),
+        &default_headers(),
+        &[],
+        None,
+        Some("movie.mkv"),
+        Some("test_secret"),
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    assert!(url.ends_with("/proxy/stream/movie.mkv"), "got: {url}");
+    let (_, after_token) = url.split_once("/_token_").unwrap();
+    assert!(!after_token.contains("//"), "got: {url}");
 }
 
 /// Filename is appended after the endpoint path, not before the token.
@@ -549,6 +609,7 @@ fn unencrypted_url_filename_in_path() {
 #[cfg(test)]
 mod middleware_tests {
     use actix_web::{test, web, App, HttpRequest, HttpResponse};
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use mediaflow_proxy_light::auth::encryption::{EncryptionHandler, ProxyData};
     use mediaflow_proxy_light::auth::middleware::AuthMiddleware;
 
@@ -562,31 +623,62 @@ mod middleware_tests {
         h.encrypt(&pd).unwrap()
     }
 
-    /// Runs `uri` through the middleware and returns the status and body,
-    /// rendering a rejection the way the HTTP dispatcher would.
-    async fn status_and_body(uri: &str) -> (u16, String) {
+    fn seal(password: &str, pd: ProxyData) -> String {
+        EncryptionHandler::new(password.as_bytes())
+            .unwrap()
+            .encrypt(&pd)
+            .unwrap()
+    }
+
+    fn stream_pd() -> ProxyData {
+        ProxyData {
+            destination: "https://cdn.example.com/stream.m3u8".into(),
+            endpoint: Some("/proxy/stream".into()),
+            ..Default::default()
+        }
+    }
+
+    /// Status, all response headers (sorted) and body.
+    type Outcome = (u16, Vec<(String, String)>, String);
+
+    /// Runs `uri` through the middleware (password "secret") and returns what
+    /// the client would receive, rendering a rejection the way the HTTP
+    /// dispatcher would.
+    async fn respond(uri: &str, headers: &[(&str, &str)]) -> Outcome {
         let app = test::init_service(
             App::new()
                 .wrap(AuthMiddleware::new("secret".into()))
                 .default_service(web::to(echo_path)),
         )
         .await;
-        let req = test::TestRequest::get().uri(uri).to_request();
-        match test::try_call_service(&app, req).await {
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                let body = test::read_body(resp).await;
-                (status, String::from_utf8_lossy(&body).into_owned())
-            }
-            Err(err) => {
-                let resp = err.error_response();
-                let status = resp.status().as_u16();
-                let body = actix_web::body::to_bytes(resp.into_body())
-                    .await
-                    .unwrap_or_default();
-                (status, String::from_utf8_lossy(&body).into_owned())
-            }
+        let mut req = test::TestRequest::get().uri(uri);
+        for &(name, value) in headers {
+            req = req.insert_header((name, value));
         }
+        let resp = match test::try_call_service(&app, req.to_request()).await {
+            Ok(resp) => resp.into_parts().1.map_into_boxed_body(),
+            Err(err) => err.error_response(),
+        };
+        let status = resp.status().as_u16();
+        let mut header_list: Vec<(String, String)> = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or_default().to_string()))
+            .collect();
+        header_list.sort();
+        let body = actix_web::body::to_bytes(resp.into_body())
+            .await
+            .unwrap_or_default();
+        (
+            status,
+            header_list,
+            String::from_utf8_lossy(&body).into_owned(),
+        )
+    }
+
+    async fn status_and_body(uri: &str) -> (u16, String) {
+        let (status, _, body) = respond(uri, &[]).await;
+        (status, body)
     }
 
     /// Returns 200 with the request path as body — lets us verify URI rewriting.
@@ -701,7 +793,36 @@ mod middleware_tests {
         assert_eq!(resp.status(), 200, "?api_password= must be accepted");
     }
 
-    // ── 5d. No password configured → allow everything ────────────────────────
+    // ── 5d. No password configured → allow everything but tokens ─────────────
+
+    /// Without a password there is no key: tokens get an explicit 401 that
+    /// points at the misconfiguration, whichever way they are sent.
+    #[actix_web::test]
+    async fn no_password_configured_refuses_tokens() {
+        let app = test::init_service(
+            App::new()
+                .wrap(AuthMiddleware::new("".into()))
+                .default_service(web::to(echo_path)),
+        )
+        .await;
+        for uri in [
+            "/_token_AAAA/proxy/stream",
+            "/proxy/stream?token=AAAA",
+            "/proxy/stream?token=",
+        ] {
+            let err = test::try_call_service(&app, test::TestRequest::get().uri(uri).to_request())
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{uri} must be refused"));
+            let resp = err.error_response();
+            assert_eq!(resp.status().as_u16(), 401, "{uri}");
+            let body = actix_web::body::to_bytes(resp.into_body()).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&body).contains("no api_password configured"),
+                "{uri}"
+            );
+        }
+    }
 
     #[actix_web::test]
     async fn no_password_configured_allows_all() {
@@ -746,31 +867,135 @@ mod middleware_tests {
 
     const GENERIC_401: &str = r#"{"error":"Invalid or expired token"}"#;
 
+    /// Every way a token can be refused looks exactly the same to the
+    /// client: status, headers and body.
     #[actix_web::test]
-    async fn forged_and_tampered_tokens_get_the_same_401() {
-        let token = make_token("secret", "https://cdn.example.com/stream.m3u8");
+    async fn every_token_rejection_is_identical_over_http() {
+        let token = seal("secret", stream_pd());
         let mut tampered = token.clone().into_bytes();
         let last = tampered.len() - 1;
         tampered[last] = if tampered[last] == b'A' { b'B' } else { b'A' };
         let tampered = String::from_utf8(tampered).unwrap();
-        let other_key = make_token("other", "https://cdn.example.com/stream.m3u8");
+        let mut raw = URL_SAFE_NO_PAD.decode(&token).unwrap();
+        raw[0] = raw[0].wrapping_add(1);
+        let other_version = URL_SAFE_NO_PAD.encode(&raw);
+        let other_key = seal("other", stream_pd());
+        let expired = seal(
+            "secret",
+            ProxyData {
+                exp: Some(1),
+                ..stream_pd()
+            },
+        );
+        let bound = seal(
+            "secret",
+            ProxyData {
+                ip: Some("1.2.3.4".into()),
+                ..stream_pd()
+            },
+        );
+        let no_destination = seal(
+            "secret",
+            ProxyData {
+                destination: String::new(),
+                ..stream_pd()
+            },
+        );
         // Python-era AES-CBC token (password "test_secret").
         let legacy = "AAECAwQFBgcICQoLDA0OD1NDNLU6BmO_093POOmfhHoL29QQVC_7Zf3ZkxMIV0AmCCVw7DPCWWcA59PdeoN7PQ";
 
-        for (case, uri) in [
-            ("tampered path", format!("/_token_{tampered}/proxy/stream")),
-            ("tampered query", format!("/proxy/stream?token={tampered}")),
-            ("other key", format!("/_token_{other_key}/proxy/stream")),
-            ("legacy cbc", format!("/_token_{legacy}/proxy/stream")),
-            ("garbage", "/_token_AAAA/proxy/stream".to_string()),
-            ("not base64", "/_token_%21%21/proxy/stream".to_string()),
-        ] {
-            assert_eq!(
-                status_and_body(&uri).await,
-                (401, GENERIC_401.to_string()),
-                "{case}"
-            );
+        type Case<'a> = (&'a str, String, Vec<(&'a str, &'a str)>);
+        let cases: Vec<Case> = vec![
+            (
+                "tampered path",
+                format!("/_token_{tampered}/proxy/stream"),
+                vec![],
+            ),
+            (
+                "tampered query",
+                format!("/proxy/stream?token={tampered}"),
+                vec![],
+            ),
+            (
+                "other version",
+                format!("/_token_{other_version}/proxy/stream"),
+                vec![],
+            ),
+            (
+                "other key",
+                format!("/_token_{other_key}/proxy/stream"),
+                vec![],
+            ),
+            (
+                "legacy cbc",
+                format!("/_token_{legacy}/proxy/stream"),
+                vec![],
+            ),
+            ("garbage", "/_token_AAAA/proxy/stream".into(), vec![]),
+            ("not base64", "/_token_%21%21/proxy/stream".into(), vec![]),
+            ("empty path token", "/_token_/proxy/stream".into(), vec![]),
+            ("empty query token", "/proxy/stream?token=".into(), vec![]),
+            ("expired", format!("/_token_{expired}/proxy/stream"), vec![]),
+            (
+                "other ip",
+                format!("/_token_{bound}/proxy/stream"),
+                vec![("x-forwarded-for", "9.9.9.9")],
+            ),
+            (
+                "unknown ip",
+                format!("/_token_{bound}/proxy/stream"),
+                vec![],
+            ),
+            (
+                "no destination",
+                format!("/_token_{no_destination}/proxy/stream"),
+                vec![],
+            ),
+            (
+                "other endpoint",
+                format!("/_token_{token}/proxy/ip"),
+                vec![],
+            ),
+            (
+                "dot segment",
+                format!("/_token_{token}/proxy/stream/../ip"),
+                vec![],
+            ),
+            (
+                "double slash",
+                format!("/_token_{token}//proxy/stream"),
+                vec![],
+            ),
+            (
+                "with origin",
+                format!("/_token_{tampered}/proxy/stream"),
+                vec![("origin", "https://evil.example")],
+            ),
+        ];
+
+        let reference = respond(&cases[0].1, &cases[0].2).await;
+        assert_eq!(reference.0, 401);
+        assert_eq!(reference.2, GENERIC_401);
+        for (case, uri, headers) in &cases {
+            assert_eq!(&respond(uri, headers).await, &reference, "{case}");
         }
+
+        // The same IP-bound token is accepted from its own address.
+        let (status, _, _) = respond(
+            &format!("/_token_{bound}/proxy/stream"),
+            &[("x-forwarded-for", "1.2.3.4")],
+        )
+        .await;
+        assert_eq!(status, 200);
+    }
+
+    #[actix_web::test]
+    async fn query_token_accepted_with_a_filename() {
+        let token = seal("secret", stream_pd());
+        assert_eq!(
+            status_and_body(&format!("/proxy/stream/movie.mkv?token={token}")).await,
+            (200, "/proxy/stream/movie.mkv".to_string())
+        );
     }
 
     #[actix_web::test]
@@ -789,6 +1014,11 @@ mod middleware_tests {
                 "/_token_…{path}"
             );
         }
+        // Spelled differently from the endpoint it was minted for.
+        assert_eq!(
+            status_and_body(&format!("/_token_{token}/proxy/%73tream")).await,
+            (401, GENERIC_401.to_string())
+        );
         // No path after the token at all.
         assert_eq!(
             status_and_body(&format!("/_token_{token}")).await,

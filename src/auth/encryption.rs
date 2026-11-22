@@ -26,6 +26,7 @@ use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::AppError;
+use crate::utils::client_ip::parse_ip;
 
 /// The only error message a client ever sees for a rejected token.
 pub const INVALID_TOKEN: &str = "Invalid or expired token";
@@ -36,8 +37,9 @@ const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 /// HKDF `info`: ties the derived key to this one purpose.
 const KEY_INFO: &[u8] = b"mediaflow-proxy-light/token-key/v1";
-/// Associated data authenticated alongside every token.
-const TOKEN_AAD: &[u8] = b"mediaflow-proxy-light/token/v1";
+/// Associated data authenticated alongside every token, followed by the
+/// version byte (see [`token_aad`]).
+const TOKEN_AAD: &[u8] = b"mediaflow-proxy-light/token";
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct ProxyData {
@@ -85,7 +87,7 @@ impl EncryptionHandler {
                 Nonce::from_slice(&nonce),
                 Payload {
                     msg: &plaintext,
-                    aad: TOKEN_AAD,
+                    aad: &token_aad(TOKEN_VERSION),
                 },
             )
             .map_err(|_| AppError::Internal("Failed to encrypt proxy data".to_string()))?;
@@ -142,7 +144,7 @@ impl EncryptionHandler {
                 Nonce::from_slice(nonce),
                 Payload {
                     msg: ciphertext,
-                    aad: TOKEN_AAD,
+                    aad: &token_aad(version[0]),
                 },
             )
             .map_err(|_| "token failed authentication")?;
@@ -157,8 +159,10 @@ impl EncryptionHandler {
             return Err("token has expired");
         }
         if let Some(bound_ip) = &data.ip {
-            // Fail closed: a token bound to an IP is useless without one.
-            if client_ip != Some(bound_ip.as_str()) {
+            // Compared as canonical addresses; fail closed when either side
+            // is missing or unparsable.
+            let bound = parse_ip(bound_ip);
+            if bound.is_none() || bound != client_ip.and_then(parse_ip) {
                 return Err("token is bound to another client IP");
             }
         }
@@ -167,7 +171,8 @@ impl EncryptionHandler {
 }
 
 /// Whether a token minted for `endpoint` may be used on `path`: the path must
-/// be the endpoint itself or sit below it (`/proxy/stream/<filename>`).
+/// be the endpoint itself or sit below it (`/proxy/stream/<filename>`), and
+/// may not contain `.` or `..` segments, even percent-encoded.
 fn endpoint_allows(endpoint: Option<&str>, path: &str) -> bool {
     let Some(endpoint) = endpoint.map(|e| e.trim_end_matches('/')) else {
         return false;
@@ -175,10 +180,27 @@ fn endpoint_allows(endpoint: Option<&str>, path: &str) -> bool {
     if endpoint.is_empty() || !endpoint.starts_with('/') {
         return false;
     }
+    if has_dot_segment(path) || has_dot_segment(endpoint) {
+        return false;
+    }
     path == endpoint
         || path
             .strip_prefix(endpoint)
             .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn has_dot_segment(path: &str) -> bool {
+    path.split('/').any(|segment| {
+        let decoded = urlencoding::decode(segment).unwrap_or_else(|_| segment.into());
+        decoded == "." || decoded == ".."
+    })
+}
+
+/// Associated data for a token of `version`.
+fn token_aad(version: u8) -> Vec<u8> {
+    let mut aad = TOKEN_AAD.to_vec();
+    aad.push(version);
+    aad
 }
 
 fn reject(reason: &'static str) -> AppError {
@@ -361,6 +383,29 @@ mod tests {
     }
 
     #[test]
+    fn ip_binding_compares_canonical_addresses() {
+        let h = handler();
+        let bound_to = |ip: &str| {
+            h.encrypt(&ProxyData {
+                ip: Some(ip.into()),
+                ..stream_data()
+            })
+            .unwrap()
+        };
+        let token = bound_to("1.2.3.4");
+        for same in ["1.2.3.4", "1.2.3.4:5678", "::ffff:1.2.3.4"] {
+            assert!(h.decrypt(&token, Some(same)).is_ok(), "{same}");
+        }
+        assert!(h.decrypt(&token, Some("1.2.3.5")).is_err());
+        let v6 = bound_to("2001:db8:0::1");
+        assert!(h.decrypt(&v6, Some("[2001:db8::1]:443")).is_ok());
+        // A bound IP that doesn't parse can never match.
+        assert!(h
+            .decrypt(&bound_to("not-an-ip"), Some("not-an-ip"))
+            .is_err());
+    }
+
+    #[test]
     fn endpoint_binding() {
         let h = handler();
         let token = h.encrypt(&stream_data()).unwrap();
@@ -374,6 +419,12 @@ mod tests {
             "/",
             "/dashboard/stats",
             "",
+            "//proxy/stream",
+            "/proxy/%73tream",
+            "/proxy/stream/../ip",
+            "/proxy/stream/%2e%2e/ip",
+            "/proxy/stream/%2E./ip",
+            "/proxy/stream/./movie.mkv",
         ] {
             assert!(h.authorize(&token, None, denied).is_err(), "{denied}");
         }
