@@ -38,7 +38,11 @@ pool_max_idle_per_host = 100
 # Maximum idle upstream connections retained per host.
 
 [auth]
-api_password = "your-password"  # Required. Same value as AIO Reborn's MEDIAFLOW_API_PASSWORD (also unlocks the dashboard at /)
+# Required, and deliberately not set here: the Docker images ship this file as
+# /app/config.toml, and a password written in it would be public. Set it with
+# APP__AUTH__API_PASSWORD (same value as AIO Reborn's MEDIAFLOW_API_PASSWORD; it
+# also unlocks the dashboard at /), or uncomment the line in your own copy.
+# api_password = "your-password"
 token_ttl = 172800              # Longest lifetime a stream token may have left, in seconds (0 = no cap)
 
 # ---------------------------------------------------------------------------

@@ -4,8 +4,9 @@
 [Unit]
 Description=MediaFlow Proxy Light
 Documentation=https://github.com/buildermaxi/mediaflow-proxy-light
-After=network-online.target
-Wants=network-online.target
+# Tokens carry an expiry: wait for the clock to be set (a Pi has no RTC).
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
 
 [Service]
 ExecStart=/usr/local/bin/mediaflow-proxy-light

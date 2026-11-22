@@ -20,7 +20,7 @@ use proxy::{handler, stream::StreamManager};
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     // Load config first so log_level from APP__LOG_LEVEL is available.
-    let config = Config::from_env().expect("Failed to load configuration");
+    let mut config = Config::from_env().expect("Failed to load configuration");
 
     // RUST_LOG takes precedence; fall back to config.log_level.
     let log_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| config.log_level.clone());
@@ -39,14 +39,16 @@ async fn main() -> std::io::Result<()> {
         .try_init()
         .expect("Failed to initialize logging");
 
-    // No password, no server: it authenticates `/proxy/ip` and the dashboard,
-    // and it is the key stream tokens are sealed with by the client.
-    if config.auth.api_password.is_empty() {
-        tracing::error!(
-            "APP__AUTH__API_PASSWORD is not set. Set it (the same value as in AIO Reborn's \
-             MEDIAFLOW_API_PASSWORD) and restart."
-        );
-        std::process::exit(1);
+    match config.validate() {
+        Ok(warnings) => {
+            for warning in warnings {
+                tracing::warn!("{warning}");
+            }
+        }
+        Err(reason) => {
+            tracing::error!("{reason}");
+            std::process::exit(1);
+        }
     }
 
     let auth_middleware =

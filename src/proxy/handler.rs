@@ -27,10 +27,8 @@ async fn handle_proxy_request(
     proxy_data: web::ReqData<ProxyData>,
     is_head: bool,
 ) -> AppResult<HttpResponse> {
+    // Never empty: the token is refused without a destination.
     let destination = proxy_data.destination.clone();
-    if destination.is_empty() {
-        return Err(AppError::BadRequest("Missing destination URL".into()));
-    }
 
     // Only the player's seek headers are forwarded.
     let mut request_headers = HeaderMap::new();
@@ -124,19 +122,19 @@ pub async fn proxy_stream_head(
 // Public IP
 // ---------------------------------------------------------------------------
 
-// Tried in order; first IPv4 answer wins. Looked up on every call, so the
-// answer is the IP the streams actually leave from: the one AIO Reborn binds
-// debrid links to (it caches it on its side). Debrid services are reached
-// over IPv4, so an IPv6 answer is skipped.
+// Asked in parallel; the first IPv4 answer wins. Looked up on every call, so
+// the answer is the IP the streams actually leave from: the one AIO Reborn
+// binds debrid links to (it caches it on its side). Debrid services are
+// reached over IPv4, so an IPv6 answer is skipped.
 const IP_LOOKUP_SERVICES: &[(&str, &str)] = &[
     ("https://api.ipify.org?format=json", "ip"),
     ("https://ipinfo.io/json", "ip"),
     ("https://httpbin.org/ip", "origin"),
 ];
 
-/// Per-service cap, so a stalled lookup fails all three well within the
-/// caller's own timeout.
-const IP_LOOKUP_TIMEOUT: Duration = Duration::from_secs(8);
+/// Per-service cap. The services are asked at once, so the whole lookup ends
+/// within this, well inside AIO Reborn's 10 s timeout.
+const IP_LOOKUP_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// The IPv4 address in a lookup answer (`httpbin` may list several,
 /// comma-separated: the first one is the client).
@@ -151,30 +149,37 @@ pub async fn get_public_ip(
     if let Some(ref ip) = forward_cfg.public_ip {
         return Ok(HttpResponse::Ok().json(serde_json::json!({ "ip": ip })));
     }
-    for (url, key) in IP_LOOKUP_SERVICES {
-        let lookup = async {
-            let resp = stream_manager
-                .make_request((*url).to_string(), HeaderMap::new())
-                .await?;
-            resp.json::<serde_json::Value>()
-                .await
-                .map_err(|e| AppError::Upstream(format!("body parse failed: {e}")))
-        };
-        match tokio::time::timeout(IP_LOOKUP_TIMEOUT, lookup).await {
-            Ok(Ok(data)) => {
-                let answer = data.get(*key).and_then(|v| v.as_str()).unwrap_or_default();
-                if let Some(ip) = ipv4_of(answer) {
-                    return Ok(HttpResponse::Ok().json(serde_json::json!({ "ip": ip.to_string() })));
+    let lookups = IP_LOOKUP_SERVICES.iter().map(|&(url, key)| {
+        let stream_manager = stream_manager.clone();
+        Box::pin(async move {
+            let lookup = async {
+                let resp = stream_manager
+                    .make_request(url.to_string(), HeaderMap::new())
+                    .await?;
+                resp.json::<serde_json::Value>()
+                    .await
+                    .map_err(|e| AppError::Upstream(format!("body parse failed: {e}")))
+            };
+            match tokio::time::timeout(IP_LOOKUP_TIMEOUT, lookup).await {
+                Ok(Ok(data)) => {
+                    let answer = data.get(key).and_then(|v| v.as_str()).unwrap_or_default();
+                    if let Some(ip) = ipv4_of(answer) {
+                        return Ok(ip);
+                    }
+                    tracing::warn!("IP lookup {} returned no IPv4 '{}' field", url, key);
                 }
-                tracing::warn!("IP lookup {} returned no IPv4 '{}' field", url, key);
+                Ok(Err(e)) => tracing::warn!("IP lookup {} failed: {}", url, e),
+                Err(_) => tracing::warn!(
+                    "IP lookup {} timed out after {} s",
+                    url,
+                    IP_LOOKUP_TIMEOUT.as_secs()
+                ),
             }
-            Ok(Err(e)) => tracing::warn!("IP lookup {} failed: {}", url, e),
-            Err(_) => tracing::warn!(
-                "IP lookup {} timed out after {} s",
-                url,
-                IP_LOOKUP_TIMEOUT.as_secs()
-            ),
-        }
+            Err(())
+        })
+    });
+    if let Ok((ip, _)) = futures::future::select_ok(lookups).await {
+        return Ok(HttpResponse::Ok().json(serde_json::json!({ "ip": ip.to_string() })));
     }
 
     Err(AppError::Upstream(

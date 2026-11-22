@@ -4,12 +4,12 @@ use actix_web::{
     Error,
 };
 use futures::future::LocalBoxFuture;
-use sha2::{Digest, Sha256};
 use std::future::{ready, Ready};
 use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::auth::encryption::EncryptionHandler;
+use crate::auth::session::password_matches;
 use crate::error::AppError;
 
 /// Routes that authenticate themselves, so the middleware lets them through:
@@ -50,27 +50,12 @@ impl AuthMiddleware {
     }
 }
 
-/// The `api_password` query parameter, percent-decoded.
+/// The `api_password` query parameter, form-decoded (`%XX` and `+` for a
+/// space, as `URLSearchParams` writes it).
 fn query_password(query_string: &str) -> Option<String> {
-    query_string.split('&').find_map(|pair| {
-        let (key, value) = pair.split_once('=')?;
-        (key == "api_password").then(|| {
-            urlencoding::decode(value)
-                .unwrap_or_else(|_| value.into())
-                .into_owned()
-        })
-    })
-}
-
-/// Compares two secrets without leaking, through timing, how much of them
-/// matches: fixed-length digests are compared byte by byte, all the way.
-fn secrets_match(given: &str, expected: &str) -> bool {
-    let a = Sha256::digest(given.as_bytes());
-    let b = Sha256::digest(expected.as_bytes());
-    a.iter()
-        .zip(b.iter())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
+    url::form_urlencoded::parse(query_string.as_bytes())
+        .find(|(key, _)| key == "api_password")
+        .map(|(_, value)| value.into_owned())
 }
 
 impl<S, B> Transform<S, ServiceRequest> for AuthMiddleware
@@ -155,7 +140,8 @@ where
 
             if req.path() == PASSWORD_ENDPOINT {
                 let given = query_password(req.query_string());
-                if given.is_some_and(|given| secrets_match(&given, &api_password)) {
+                // Constant time, and never true for an empty configured password.
+                if given.is_some_and(|given| password_matches(&given, &api_password)) {
                     return service.call(req).await;
                 }
             }
@@ -175,15 +161,19 @@ mod tests {
             query_password("a=1&api_password=p%40ss&b=2").as_deref(),
             Some("p@ss")
         );
+        // `URLSearchParams` writes a space as `+`.
+        assert_eq!(
+            query_password("api_password=a+b%20c").as_deref(),
+            Some("a b c")
+        );
         assert_eq!(query_password("api_password_x=1"), None);
         assert_eq!(query_password(""), None);
     }
 
     #[test]
-    fn secrets_match_only_identical_values() {
-        assert!(secrets_match("secret", "secret"));
-        assert!(!secrets_match("secret", "secreT"));
-        assert!(!secrets_match("secret", "secret-longer"));
-        assert!(!secrets_match("", "secret"));
+    fn an_empty_configured_password_matches_nothing() {
+        assert!(password_matches("secret", "secret"));
+        assert!(!password_matches("", ""));
+        assert!(!password_matches("secret", "secret-longer"));
     }
 }

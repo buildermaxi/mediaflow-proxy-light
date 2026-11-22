@@ -14,6 +14,7 @@ fn setup() -> MutexGuard<'static, ()> {
     env::remove_var("APP__AUTH__TOKEN_TTL");
     env::remove_var("APP__PROXY__CONNECT_TIMEOUT");
     env::remove_var("API_PASSWORD");
+    env::remove_var("APP__FORWARD__PUBLIC_IP");
     env::remove_var("CONFIG_PATH");
     guard
 }
@@ -95,4 +96,58 @@ connect_timeout = 12
         config.proxy.follow_redirects,
         "redirects followed by default"
     );
+}
+
+/// The password is the exact string AIO Reborn derives its token key from:
+/// no numeric conversion.
+#[test]
+fn numeric_looking_password_is_read_verbatim() {
+    let _guard = setup();
+    for raw in ["00123456", "1e5", "0.50", "true"] {
+        env::set_var("APP__AUTH__API_PASSWORD", raw);
+        assert_eq!(Config::from_env().unwrap().auth.api_password, raw);
+    }
+    env::remove_var("APP__AUTH__API_PASSWORD");
+}
+
+/// The Docker images ship config-example.toml as /app/config.toml: it must
+/// not set a password, or containers would start with a public one.
+#[test]
+fn example_config_sets_no_password() {
+    let _guard = setup();
+    env::set_var(
+        "CONFIG_PATH",
+        concat!(env!("CARGO_MANIFEST_DIR"), "/config-example.toml"),
+    );
+    let mut config = Config::from_env().unwrap();
+    env::remove_var("CONFIG_PATH");
+    assert_eq!(config.auth.api_password, "");
+    assert!(config.validate().is_err(), "must refuse to start");
+}
+
+#[test]
+fn validate_refuses_example_passwords_and_bad_public_ips() {
+    let _guard = setup();
+    let config = |password: &str, public_ip: Option<&str>| {
+        let mut config = Config::from_env().unwrap();
+        config.auth.api_password = password.to_string();
+        config.forward.public_ip = public_ip.map(str::to_string);
+        config
+    };
+    for password in ["", "your-password", "changeme"] {
+        assert!(config(password, None).validate().is_err(), "{password:?}");
+    }
+    let strong = "0123456789abcdef0123";
+    assert!(config(strong, Some("2a01:e0a::1")).validate().is_err());
+    assert!(config(strong, Some("not an ip")).validate().is_err());
+
+    let mut ok = config(strong, Some(" 82.66.1.2 "));
+    assert_eq!(ok.validate().unwrap(), Vec::<String>::new());
+    assert_eq!(ok.forward.public_ip.as_deref(), Some("82.66.1.2"));
+    let mut empty = config(strong, Some(""));
+    empty.validate().unwrap();
+    assert_eq!(empty.forward.public_ip, None, "empty means: look it up");
+
+    let warnings = config("short", None).validate().unwrap();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
 }

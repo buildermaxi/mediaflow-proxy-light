@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::net::Ipv4Addr;
 use std::path::Path;
 use tracing::warn;
 
@@ -152,7 +153,66 @@ impl Config {
                 .try_parsing(true),
         );
 
-        let config = builder.build()?;
-        config.try_deserialize()
+        let mut config: Config = builder.build()?.try_deserialize()?;
+        // `try_parsing` turns numeric-looking values into numbers ("00123456" →
+        // 123456, "1e5" → 100000): the password must stay the exact string the
+        // client derives its token key from.
+        if let Ok(raw) = std::env::var("APP__AUTH__API_PASSWORD") {
+            config.auth.api_password = raw;
+        }
+        Ok(config)
+    }
+
+    /// Checks what the server must not run with, normalising along the way.
+    /// Returns the warnings to log, or the reason to refuse to start.
+    pub fn validate(&mut self) -> Result<Vec<String>, String> {
+        let mut warnings = Vec::new();
+
+        // No password, no server: it authenticates `/proxy/ip` and the
+        // dashboard, and it is the key stream tokens are sealed with.
+        let password = self.auth.api_password.as_str();
+        if password.is_empty() {
+            return Err(
+                "APP__AUTH__API_PASSWORD is not set. Set it (the same value as AIO \
+                 Reborn's MEDIAFLOW_API_PASSWORD) and restart."
+                    .to_string(),
+            );
+        }
+        if ["your-password", "changeme"].contains(&password) {
+            return Err(format!(
+                "APP__AUTH__API_PASSWORD is the example value \"{password}\": set a secret one."
+            ));
+        }
+        if password.chars().count() < 16 {
+            warnings.push(
+                "APP__AUTH__API_PASSWORD is shorter than 16 characters: a captured playback \
+                 link would allow guessing it offline."
+                    .to_string(),
+            );
+        }
+
+        // `/proxy/ip` only answers an IPv4 (debrid services are IPv4-only).
+        match self.forward.public_ip.as_deref().map(str::trim) {
+            None => {}
+            Some("") => self.forward.public_ip = None,
+            Some(ip) => match ip.parse::<Ipv4Addr>() {
+                Ok(ip) => self.forward.public_ip = Some(ip.to_string()),
+                Err(_) => {
+                    return Err(format!(
+                        "APP__FORWARD__PUBLIC_IP must be an IPv4 address, got \"{ip}\"."
+                    ))
+                }
+            },
+        }
+
+        for legacy in ["API_PASSWORD", "PROXY_URL", "ALL_PROXY"] {
+            if std::env::var_os(legacy).is_some() {
+                warnings.push(format!(
+                    "{legacy} is no longer read: only the APP__* variables are (and upstream \
+                     proxies are gone)."
+                ));
+            }
+        }
+        Ok(warnings)
     }
 }

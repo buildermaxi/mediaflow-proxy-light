@@ -170,10 +170,8 @@ impl EncryptionHandler {
         }
         if self.max_lifetime > 0 {
             match data.exp {
-                None => return Err("token has no expiry"),
-                Some(exp) if exp > now.saturating_add(self.max_lifetime) => {
-                    return Err("token lives longer than the server allows")
-                }
+                None => return Err(NO_EXPIRY),
+                Some(exp) if exp > now.saturating_add(self.max_lifetime) => return Err(TOO_LONG),
                 Some(_) => {}
             }
         }
@@ -215,9 +213,20 @@ fn token_aad(version: u8) -> Vec<u8> {
 }
 
 fn reject(reason: &'static str) -> AppError {
-    tracing::debug!("rejected proxy token: {reason}");
+    if reason == NO_EXPIRY || reason == TOO_LONG {
+        // A configuration mismatch, not an attack: every link would be refused.
+        tracing::warn!(
+            "rejected proxy token: {reason} — check APP__AUTH__TOKEN_TTL against the \
+             lifetime of the links AIO Reborn mints (24 h)"
+        );
+    } else {
+        tracing::debug!("rejected proxy token: {reason}");
+    }
     AppError::Auth(INVALID_TOKEN.to_string())
 }
+
+const NO_EXPIRY: &str = "token has no expiry";
+const TOO_LONG: &str = "token lives longer than the server allows";
 
 /// Current Unix time in seconds (0 if the clock is before 1970).
 pub fn unix_now() -> u64 {

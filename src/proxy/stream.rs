@@ -312,14 +312,22 @@ impl StreamManager {
         let started = Instant::now();
         let sent = timeout(header_timeout, client.get(&url).headers(headers).send()).await;
         let tally = self.record_upstream(&url, started, &sent);
+        // Errors never carry the upstream URL: it is a debrid link or an
+        // addon URL holding its configuration, and the message goes back to
+        // the client and into the logs.
         let response = sent
             .map_err(|_| {
                 AppError::Proxy(format!(
-                    "Request timed out after {} s waiting for response headers from {url}",
+                    "Request timed out after {} s waiting for response headers",
                     header_timeout.as_secs()
                 ))
             })?
-            .map_err(|e| AppError::Proxy(format!("Failed to connect to upstream: {}", e)))?;
+            .map_err(|e| {
+                AppError::Proxy(format!(
+                    "Failed to connect to upstream: {}",
+                    e.without_url()
+                ))
+            })?;
 
         // Accept 2xx (including 206 Partial Content) and 3xx redirects that reqwest follows.
         // Reject only genuine error status codes (4xx, 5xx).
@@ -382,7 +390,7 @@ impl StreamManager {
             while let Some(chunk) = chunks.next().await {
                 let chunk = chunk
                     .inspect(|bytes| tally.add(bytes.len()))
-                    .map_err(|e| AppError::Proxy(format!("Stream error: {}", e)));
+                    .map_err(|e| AppError::Proxy(format!("Stream error: {}", e.without_url())));
                 let failed = chunk.is_err();
                 // Bounded by the budget itself, so the cast can't truncate.
                 let size = chunk.as_ref().map_or(0, Bytes::len).min(BODY_BUFFER_BYTES) as u32;

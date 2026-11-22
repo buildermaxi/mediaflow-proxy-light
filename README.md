@@ -28,7 +28,8 @@ minted by AIO Reborn's own code).
 - A token that wasn't sealed with the API password, or was modified, is refused.
 - It only works on the endpoint it was minted for (`/proxy/stream`).
 - It must expire, at most `APP__AUTH__TOKEN_TTL` from now (48 hours by default), whatever
-  lifetime the client asked for.
+  lifetime the client asked for. AIO Reborn mints 24-hour links, so keep the limit at 24 hours
+  or more. Expiry needs a correct clock: the systemd unit waits for `time-sync.target`.
 - Everything a stream needs is in the token: any query string added to a token URL is dropped.
 - Every rejected token gets the same `401 {"error":"Invalid or expired token"}`.
 
@@ -52,7 +53,7 @@ Open the server root (`/`) and sign in with the API password. The server answers
 an `HttpOnly`, `SameSite=Strict` session cookie (an HMAC of the password, never the
 password itself) and checks it on the page and on every JSON feed
 (`/dashboard/stats`, `/dashboard/history`). The server refuses to start without an API
-password. Changing the password signs every browser out.
+password (or with the example one). Changing the password signs every browser out.
 
 ## Run with Docker
 
@@ -106,7 +107,8 @@ APP__SERVER__PORT=8888
 APP__SERVER__WORKERS=4
 
 # Auth — required: the server doesn't start without a password. Same value as
-# AIO Reborn's MEDIAFLOW_API_PASSWORD; it also unlocks the dashboard.
+# AIO Reborn's MEDIAFLOW_API_PASSWORD; it also unlocks the dashboard. Use 16
+# characters or more (install.sh generates one).
 APP__AUTH__API_PASSWORD=your-secure-password
 APP__AUTH__TOKEN_TTL=172800   # longest lifetime a stream token may have left, in seconds (0 = no cap)
 
@@ -118,7 +120,7 @@ APP__PROXY__MAX_CONCURRENT_PER_HOST=10
 APP__PROXY__POOL_IDLE_TIMEOUT=90
 APP__PROXY__POOL_MAX_IDLE_PER_HOST=100
 
-# Public IP returned by /proxy/ip. When unset, each call looks it up (IPv4 only).
+# Public IPv4 returned by /proxy/ip. When unset, each call looks it up (IPv4 only).
 APP__FORWARD__PUBLIC_IP=203.0.113.10
 
 # Logging
