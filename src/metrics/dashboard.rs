@@ -343,17 +343,53 @@ mod tests {
             .expect("session cookie")
             .into_owned();
 
-        // Any stream token (they appear in every generated URL) passes the
-        // auth middleware, which then rewrites `/_token_…/<path>`.
+        // A stream token (they appear in every generated URL) is bound to
+        // `/proxy/stream`: the auth middleware refuses it on dashboard paths,
+        // however they are spelled.
         let token = EncryptionHandler::new(PASSWORD.as_bytes())
             .unwrap()
             .encrypt(&ProxyData {
                 destination: "https://example.com/movie.mkv".into(),
-                query_params: None,
-                request_headers: None,
-                response_headers: None,
-                exp: None,
-                ip: None,
+                endpoint: Some("/proxy/stream".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        for uri in [
+            format!("/_token_{token}/dashboard/stats"),
+            format!("/_token_{token}/dashboard/%73tats"),
+        ] {
+            let refused = test::try_call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri(&uri)
+                    .cookie(cookie.clone())
+                    .insert_header((header::ORIGIN, "http://127.0.0.1:3000"))
+                    .to_request(),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{uri} must be refused"));
+            let refused = refused.error_response();
+            assert_eq!(refused.status(), StatusCode::UNAUTHORIZED, "{uri}");
+            assert!(
+                !refused
+                    .headers()
+                    .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    && !refused
+                        .headers()
+                        .contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS),
+                "{uri} must not be readable cross-origin"
+            );
+        }
+
+        // A token minted for the dashboard does pass the middleware, which
+        // rewrites `/_token_…/<path>`: that path stays out of CORS too.
+        let dashboard_token = EncryptionHandler::new(PASSWORD.as_bytes())
+            .unwrap()
+            .encrypt(&ProxyData {
+                destination: "https://example.com/movie.mkv".into(),
+                endpoint: Some("/dashboard".into()),
+                ..Default::default()
             })
             .unwrap();
 
@@ -365,8 +401,8 @@ mod tests {
             "/dashboard/stats".to_string(),
             "/dashboard/history".to_string(),
             format!("/dashboard/%73tats?api_password={PASSWORD}"),
-            format!("/_token_{token}/dashboard/stats"),
-            format!("/_token_{token}/dashboard/%73tats"),
+            format!("/_token_{dashboard_token}/dashboard/stats"),
+            format!("/_token_{dashboard_token}/dashboard/%73tats"),
         ] {
             let res = test::call_service(
                 &app,

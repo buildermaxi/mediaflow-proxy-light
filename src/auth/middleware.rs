@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use crate::auth::encryption::{EncryptionHandler, ProxyData};
 use crate::error::AppError;
+use crate::utils::client_ip::client_ip;
 
 /// Routes that authenticate themselves, so the middleware lets them through:
 /// - `/generate_urls` reads `api_password` from its JSON body (and works
@@ -66,6 +67,19 @@ impl AuthMiddleware {
             }
         }
         params
+    }
+
+    /// The `token` query parameter, even when empty (`?token=`), which
+    /// [`Self::extract_query_params`] drops.
+    fn query_token(query_string: &str) -> Option<String> {
+        query_string.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (key == "token").then(|| {
+                urlencoding::decode(value)
+                    .unwrap_or_else(|_| value.into())
+                    .into_owned()
+            })
+        })
     }
 }
 
@@ -128,7 +142,7 @@ where
                 // that as an explicit, actionable 401 so the operator spots the
                 // misconfig from the response body instead of chasing silent
                 // 500s caused by missing ProxyData in the handler extractor.
-                if has_path_token || query_params.contains_key("token") {
+                if has_path_token || AuthMiddleware::query_token(&query_string).is_some() {
                     return Err(AppError::Auth(
                         "Server has no api_password configured but request carries an \
                          encrypted token. Set APP__AUTH__API_PASSWORD on the server to \
@@ -154,12 +168,11 @@ where
                         None => (after_marker, "/"),
                     };
 
-                    let client_ip = req
-                        .connection_info()
-                        .realip_remote_addr()
-                        .map(|s| s.to_string());
+                    let client_ip = client_ip(&req).map(|ip| ip.to_string());
+                    // The token must decrypt *and* have been minted for the
+                    // endpoint this request is for.
                     let proxy_data = handler
-                        .decrypt(token, client_ip.as_deref())
+                        .authorize(token, client_ip.as_deref(), remaining_path)
                         .map_err(Error::from)?;
 
                     // Rewrite the URI: strip the /_token_ prefix and reconstruct the
@@ -198,16 +211,13 @@ where
             let query_params = AuthMiddleware::extract_query_params(&query_string);
 
             // Check for query-param token (?token=...)
-            // Successful decryption proves knowledge of api_password — the AES key is
-            // derived from it, so a wrong key yields a padding error or non-JSON garbage.
-            if let Some(token) = query_params.get("token").and_then(|v| v.as_str()) {
+            // Tokens are AES-GCM sealed with a key derived from api_password, so
+            // one that opens was minted by this server and hasn't been modified.
+            if let Some(token) = AuthMiddleware::query_token(&query_string) {
                 if let Some(handler) = encryption_handler {
-                    let client_ip = req
-                        .connection_info()
-                        .realip_remote_addr()
-                        .map(|s| s.to_string());
+                    let client_ip = client_ip(&req).map(|ip| ip.to_string());
                     let proxy_data = handler
-                        .decrypt(token, client_ip.as_deref())
+                        .authorize(&token, client_ip.as_deref(), req.path())
                         .map_err(Error::from)?;
 
                     // Rewrite the query string: replace ?token=... with the decrypted params
@@ -275,6 +285,7 @@ fn build_proxy_data_from_query(query_params: &serde_json::Map<String, Value>) ->
         response_headers: Some(Value::Object(response_headers)),
         exp: None,
         ip: None,
+        endpoint: None,
     }
 }
 

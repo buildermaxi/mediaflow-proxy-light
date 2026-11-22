@@ -8,15 +8,22 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::boxed::Box;
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::Duration;
 
 use crate::{
-    auth::{encryption::ProxyData, EncryptionHandler},
-    config::ForwardConfig,
+    auth::{
+        encryption::{unix_now, ProxyData},
+        EncryptionHandler,
+    },
+    config::{Config, ForwardConfig},
     error::{AppError, AppResult},
     models::request::{SUPPORTED_REQUEST_HEADERS, SUPPORTED_RESPONSE_HEADERS},
     proxy::stream::{ResponseStream, StreamManager},
-    utils::base64_url::{decode_base64_url, encode_url_to_base64},
+    utils::{
+        base64_url::{decode_base64_url, encode_url_to_base64},
+        client_ip::parse_ip,
+    },
 };
 
 async fn handle_proxy_request(
@@ -188,6 +195,7 @@ pub async fn proxy_stream_head(
 /// URL-building logic behind `POST /generate_urls`.
 ///
 /// Encrypted tokens use Python's path format: `{base}/_token_{token}{endpoint_path}`.
+/// The token is bound to `endpoint`, so encrypted URLs require one.
 /// Unencrypted tokens use flat query params matching Python's encode_mediaflow_proxy_url.
 /// When `base64_encode_destination` is true and no `api_password` is provided, the
 /// destination URL is base64url-encoded and embedded in the URL path instead of `d=`.
@@ -210,11 +218,29 @@ pub fn build_proxy_url(
 ) -> AppResult<String> {
     let base = mediaflow_proxy_url.trim_end_matches('/');
     let endpoint_path = endpoint
+        .map(|ep| ep.trim_matches('/'))
         .filter(|ep| !ep.is_empty())
-        .map(|ep| format!("/{}", ep.trim_start_matches('/')))
+        .map(|ep| format!("/{ep}"))
         .unwrap_or_default();
 
     if let Some(password) = api_password.filter(|p| !p.is_empty()) {
+        // Refuse what would only produce a token the server then rejects.
+        if endpoint_path.is_empty() {
+            return Err(AppError::BadRequest(
+                "`endpoint` is required for encrypted URLs".to_string(),
+            ));
+        }
+        if destination_url.is_empty() {
+            return Err(AppError::BadRequest(
+                "`destination_url` is required for encrypted URLs".to_string(),
+            ));
+        }
+        let ip = ip.filter(|ip| !ip.is_empty());
+        if ip.is_some_and(|ip| parse_ip(ip).is_none()) {
+            return Err(AppError::BadRequest(
+                "`ip` is not a valid IP address".to_string(),
+            ));
+        }
         let handler = EncryptionHandler::new(password.as_bytes()).map_err(|e| {
             AppError::Internal(format!("Failed to create encryption handler: {}", e))
         })?;
@@ -230,14 +256,9 @@ pub fn build_proxy_url(
             response_headers: Some(
                 serde_json::to_value(response_headers).map_err(AppError::SerdeJsonError)?,
             ),
-            exp: expiration.map(|e| {
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs()
-                    + e
-            }),
+            exp: expiration.map(|e| unix_now().saturating_add(e)),
             ip: ip.map(|s| s.to_string()),
+            endpoint: Some(endpoint_path.clone()),
         };
 
         let token = handler.encrypt(&proxy_data)?;
@@ -426,8 +447,24 @@ pub struct GenerateMultiUrlRequest {
     pub urls: Vec<MultiUrlRequestItem>,
 }
 
-pub async fn generate_urls(req: web::Json<GenerateMultiUrlRequest>) -> AppResult<HttpResponse> {
+/// Lifetime (seconds) to give a token: the requested `expiration`, capped by
+/// the server's `token_ttl`, which also applies when none is requested.
+/// `0` means "no limit" for either value.
+pub fn effective_expiration(requested: Option<u64>, token_ttl: u64) -> Option<u64> {
+    match (requested.filter(|&r| r > 0), token_ttl) {
+        (None, 0) => None,
+        (None, ttl) => Some(ttl),
+        (Some(requested), 0) => Some(requested),
+        (Some(requested), ttl) => Some(requested.min(ttl)),
+    }
+}
+
+pub async fn generate_urls(
+    req: web::Json<GenerateMultiUrlRequest>,
+    config: web::Data<Arc<Config>>,
+) -> AppResult<HttpResponse> {
     let effective_password = req.api_password.as_deref().filter(|p| !p.is_empty());
+    let expiration = effective_expiration(req.expiration, config.auth.token_ttl);
     let mut encoded: Vec<String> = Vec::with_capacity(req.urls.len());
 
     for item in &req.urls {
@@ -443,7 +480,7 @@ pub async fn generate_urls(req: web::Json<GenerateMultiUrlRequest>) -> AppResult
             item.stream_transformer.as_deref(),
             item.filename.as_deref(),
             effective_password,
-            req.expiration,
+            expiration,
             req.ip.as_deref(),
             item.base64_encode_destination,
         )?;
@@ -508,6 +545,123 @@ mod tests {
             Some("CONNECT api.ipify.org:443 HTTP/1.1"),
             "lookup must go through the proxy: {seen:?}"
         );
+    }
+
+    #[actix_web::test]
+    async fn token_lifetime_defaults_to_and_is_capped_by_token_ttl() {
+        let ttl = 172_800;
+        assert_eq!(
+            effective_expiration(None, ttl),
+            Some(ttl),
+            "default applies"
+        );
+        assert_eq!(
+            effective_expiration(Some(0), ttl),
+            Some(ttl),
+            "0 = not requested"
+        );
+        assert_eq!(
+            effective_expiration(Some(3600), ttl),
+            Some(3600),
+            "shorter kept"
+        );
+        assert_eq!(
+            effective_expiration(Some(ttl * 10), ttl),
+            Some(ttl),
+            "longer capped"
+        );
+        assert_eq!(effective_expiration(None, 0), None, "ttl 0 = no default");
+        assert_eq!(effective_expiration(Some(3600), 0), Some(3600));
+    }
+
+    /// Calls `/generate_urls` with `token_ttl` configured and `body` as the
+    /// request; returns the status and the JSON body.
+    async fn generate(token_ttl: u64, body: serde_json::Value) -> (u16, serde_json::Value) {
+        let mut config = Config::from_env().expect("default config");
+        config.auth.token_ttl = token_ttl;
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(Arc::new(config)))
+                .route("/generate_urls", web::post().to(generate_urls)),
+        )
+        .await;
+        let req = test::TestRequest::post()
+            .uri("/generate_urls")
+            .set_json(body)
+            .to_request();
+        let resp = match test::try_call_service(&app, req).await {
+            Ok(resp) => resp.into_parts().1,
+            Err(err) => err.error_response(),
+        };
+        let status = resp.status().as_u16();
+        let bytes = actix_web::body::to_bytes(resp.into_body())
+            .await
+            .unwrap_or_default();
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    fn stream_request(expiration: Option<u64>) -> serde_json::Value {
+        serde_json::json!({
+            "mediaflow_proxy_url": "https://proxy.example.com",
+            "api_password": "s3cret",
+            "expiration": expiration,
+            "urls": [{
+                "endpoint": "/proxy/stream",
+                "destination_url": "https://cdn.example.com/movie.mkv",
+                "filename": "movie.mkv"
+            }]
+        })
+    }
+
+    /// Expiry (`exp`) of the single URL in a `/generate_urls` response.
+    fn exp_of(body: &serde_json::Value) -> Option<u64> {
+        let url = body["urls"][0].as_str().expect("one url");
+        let token = url
+            .split_once("/_token_")
+            .and_then(|(_, rest)| rest.split('/').next())
+            .expect("token in url");
+        EncryptionHandler::new(b"s3cret")
+            .unwrap()
+            .decrypt(token, None)
+            .unwrap()
+            .exp
+    }
+
+    /// `/generate_urls` gives encrypted URLs the server's default lifetime
+    /// when the caller (AIOStreams) doesn't ask for one, and caps longer ones.
+    #[actix_web::test]
+    async fn generate_urls_applies_and_caps_the_token_ttl() {
+        for (ttl, requested, lifetime) in [
+            (600, None, Some(600)),
+            (600, Some(60), Some(60)),
+            (600, Some(86_400), Some(600)),
+            (0, None, None),
+            (0, Some(60), Some(60)),
+        ] {
+            let before = unix_now();
+            let (status, body) = generate(ttl, stream_request(requested)).await;
+            let after = unix_now();
+            assert_eq!(status, 200, "{body}");
+            let exp = exp_of(&body);
+            match lifetime {
+                None => assert_eq!(exp, None, "ttl {ttl} requested {requested:?}"),
+                Some(lifetime) => {
+                    let exp = exp.expect("expiry set");
+                    assert!(
+                        (before + lifetime..=after + lifetime).contains(&exp),
+                        "ttl {ttl} requested {requested:?}: exp {exp}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[actix_web::test]
+    async fn generate_urls_refuses_an_encrypted_url_without_endpoint() {
+        let mut body = stream_request(None);
+        body["urls"][0]["endpoint"] = serde_json::Value::Null;
+        let (status, body) = generate(600, body).await;
+        assert_eq!(status, 400, "{body}");
     }
 
     #[actix_web::test]

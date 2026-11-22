@@ -96,6 +96,18 @@ pub struct ProxyConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct AuthConfig {
     pub api_password: String,
+    /// Maximum lifetime, in seconds, of the encrypted URLs `/generate_urls`
+    /// mints. Also applied when the caller doesn't ask for an expiration.
+    /// `0` disables both the default and the cap: URLs then never expire
+    /// unless the caller asks, and keep whatever lifetime it asks for.
+    ///
+    /// Default: `172800` (48 hours).
+    #[serde(default = "default_token_ttl")]
+    pub token_ttl: u64,
+}
+
+fn default_token_ttl() -> u64 {
+    172_800
 }
 
 // ---------------------------------------------------------------------------
