@@ -8,6 +8,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::boxed::Box;
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::{
@@ -15,7 +16,7 @@ use crate::{
         encryption::{unix_now, ProxyData},
         EncryptionHandler,
     },
-    config::ForwardConfig,
+    config::{Config, ForwardConfig},
     error::{AppError, AppResult},
     models::request::{SUPPORTED_REQUEST_HEADERS, SUPPORTED_RESPONSE_HEADERS},
     proxy::stream::{ResponseStream, StreamManager},
@@ -430,8 +431,24 @@ pub struct GenerateMultiUrlRequest {
     pub urls: Vec<MultiUrlRequestItem>,
 }
 
-pub async fn generate_urls(req: web::Json<GenerateMultiUrlRequest>) -> AppResult<HttpResponse> {
+/// Lifetime (seconds) to give a token: the requested `expiration`, capped by
+/// the server's `token_ttl`, which also applies when none is requested.
+/// `0` means "no limit" for either value.
+pub fn effective_expiration(requested: Option<u64>, token_ttl: u64) -> Option<u64> {
+    match (requested.filter(|&r| r > 0), token_ttl) {
+        (None, 0) => None,
+        (None, ttl) => Some(ttl),
+        (Some(requested), 0) => Some(requested),
+        (Some(requested), ttl) => Some(requested.min(ttl)),
+    }
+}
+
+pub async fn generate_urls(
+    req: web::Json<GenerateMultiUrlRequest>,
+    config: web::Data<Arc<Config>>,
+) -> AppResult<HttpResponse> {
     let effective_password = req.api_password.as_deref().filter(|p| !p.is_empty());
+    let expiration = effective_expiration(req.expiration, config.auth.token_ttl);
     let mut encoded: Vec<String> = Vec::with_capacity(req.urls.len());
 
     for item in &req.urls {
@@ -447,7 +464,7 @@ pub async fn generate_urls(req: web::Json<GenerateMultiUrlRequest>) -> AppResult
             item.stream_transformer.as_deref(),
             item.filename.as_deref(),
             effective_password,
-            req.expiration,
+            expiration,
             req.ip.as_deref(),
             item.base64_encode_destination,
         )?;
@@ -512,6 +529,75 @@ mod tests {
             Some("CONNECT api.ipify.org:443 HTTP/1.1"),
             "lookup must go through the proxy: {seen:?}"
         );
+    }
+
+    #[actix_web::test]
+    async fn token_lifetime_defaults_to_and_is_capped_by_token_ttl() {
+        let ttl = 172_800;
+        assert_eq!(
+            effective_expiration(None, ttl),
+            Some(ttl),
+            "default applies"
+        );
+        assert_eq!(
+            effective_expiration(Some(0), ttl),
+            Some(ttl),
+            "0 = not requested"
+        );
+        assert_eq!(
+            effective_expiration(Some(3600), ttl),
+            Some(3600),
+            "shorter kept"
+        );
+        assert_eq!(
+            effective_expiration(Some(ttl * 10), ttl),
+            Some(ttl),
+            "longer capped"
+        );
+        assert_eq!(effective_expiration(None, 0), None, "ttl 0 = no default");
+        assert_eq!(effective_expiration(Some(3600), 0), Some(3600));
+    }
+
+    /// `/generate_urls` gives encrypted URLs the server's default lifetime
+    /// when the caller (AIOStreams) doesn't ask for one.
+    #[actix_web::test]
+    async fn generate_urls_applies_the_default_token_ttl() {
+        let mut config = Config::from_env().expect("default config");
+        config.auth.token_ttl = 600;
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(Arc::new(config)))
+                .route("/generate_urls", web::post().to(generate_urls)),
+        )
+        .await;
+        let body: serde_json::Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::post()
+                .uri("/generate_urls")
+                .set_json(serde_json::json!({
+                    "mediaflow_proxy_url": "https://proxy.example.com",
+                    "api_password": "s3cret",
+                    "urls": [{
+                        "endpoint": "/proxy/stream",
+                        "destination_url": "https://cdn.example.com/movie.mkv",
+                        "filename": "movie.mkv"
+                    }]
+                }))
+                .to_request(),
+        )
+        .await;
+        let url = body["urls"][0].as_str().expect("one url");
+        let token = url
+            .split_once("/_token_")
+            .and_then(|(_, rest)| rest.split('/').next())
+            .expect("token in url");
+        let data = EncryptionHandler::new(b"s3cret")
+            .unwrap()
+            .decrypt(token, None)
+            .unwrap();
+        let exp = data.exp.expect("default expiry set");
+        let now = unix_now();
+        assert!(exp > now && exp <= now + 600, "exp {exp} vs now {now}");
     }
 
     #[actix_web::test]

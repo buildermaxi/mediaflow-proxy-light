@@ -11,6 +11,7 @@ fn setup() -> MutexGuard<'static, ()> {
     env::remove_var("APP__SERVER__HOST");
     env::remove_var("APP__SERVER__PORT");
     env::remove_var("APP__AUTH__API_PASSWORD");
+    env::remove_var("APP__AUTH__TOKEN_TTL");
     env::remove_var("APP__PROXY__CONNECT_TIMEOUT");
     env::remove_var("APP__PROXY__TRANSPORT_ROUTES");
     env::remove_var("CONFIG_PATH");
@@ -34,6 +35,16 @@ fn test_config_from_env() {
     assert_eq!(config.server.port, 8888); // Updated to match default port
     assert_eq!(config.auth.api_password, "test_password");
     assert_eq!(config.proxy.connect_timeout, 7);
+}
+
+#[test]
+fn token_ttl_defaults_to_48_hours_and_reads_env() {
+    let _guard = setup();
+    assert_eq!(Config::from_env().unwrap().auth.token_ttl, 172_800);
+
+    env::set_var("APP__AUTH__TOKEN_TTL", "3600");
+    assert_eq!(Config::from_env().unwrap().auth.token_ttl, 3600);
+    env::remove_var("APP__AUTH__TOKEN_TTL");
 }
 
 #[test]

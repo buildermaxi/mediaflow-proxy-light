@@ -21,7 +21,7 @@ Auth: `?api_password=…`, an encrypted `?token=…`, or a `/_token_…/` path p
 Encrypted URLs are sealed with AES-256-GCM (key derived from the API password with
 HKDF-SHA256), so a token that wasn't minted by this server, or was modified, is
 refused. Each token only works on the endpoint it was generated for
-(`/proxy/stream`). Every
+(`/proxy/stream`) and expires after `APP__AUTH__TOKEN_TTL` (48 hours by default). Every
 rejected token gets the same `401 {"error":"Invalid or expired token"}`.
 These tokens are not interchangeable with the Python MediaFlow Proxy's AES-CBC
 tokens: URLs generated before upgrading stop working, and AIOStreams simply
@@ -95,6 +95,7 @@ APP__SERVER__WORKERS=4
 
 # Auth (also unlocks the dashboard)
 APP__AUTH__API_PASSWORD=your-secure-password
+APP__AUTH__TOKEN_TTL=172800   # max lifetime of encrypted URLs, in seconds (0 = no default)
 
 # Upstream HTTP client
 APP__PROXY__CONNECT_TIMEOUT=30

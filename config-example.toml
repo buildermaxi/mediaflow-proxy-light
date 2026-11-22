@@ -45,6 +45,7 @@ pool_max_idle_per_host = 100
 
 [auth]
 api_password = "your-password"  # Replace with a strong secret key (also unlocks the dashboard at /)
+token_ttl = 172800              # Max lifetime of encrypted URLs, in seconds (0 = no default expiry)
 
 # ---------------------------------------------------------------------------
 # Public IP returned by GET /proxy/ip (AIOStreams binds debrid links to it)
