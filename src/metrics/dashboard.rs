@@ -215,7 +215,7 @@ mod tests {
             // CORS-wrapped /proxy scope next to them.
             test::init_service(
                 App::new()
-                    .wrap(AuthMiddleware::new($api_password.to_string()))
+                    .wrap(AuthMiddleware::new($api_password.to_string(), 0))
                     .app_data(web::Data::new(config($api_password)))
                     .app_data(web::Data::new(AppMetrics::new()))
                     .configure(routes)
@@ -400,7 +400,6 @@ mod tests {
             "/".to_string(),
             "/dashboard/stats".to_string(),
             "/dashboard/history".to_string(),
-            format!("/dashboard/%73tats?api_password={PASSWORD}"),
             format!("/_token_{dashboard_token}/dashboard/stats"),
             format!("/_token_{dashboard_token}/dashboard/%73tats"),
         ] {
@@ -425,6 +424,26 @@ mod tests {
                 "{uri} must not be readable cross-origin"
             );
         }
+
+        // The API password only opens `/proxy/ip`: a dashboard path spelled
+        // differently from the open routes is refused by the middleware.
+        let refused = match test::try_call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/dashboard/%73tats?api_password={PASSWORD}"))
+                .cookie(cookie.clone())
+                .insert_header((header::ORIGIN, "http://127.0.0.1:3000"))
+                .to_request(),
+        )
+        .await
+        {
+            Ok(_) => panic!("an api_password does not open dashboard paths"),
+            Err(err) => err.error_response(),
+        };
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        assert!(!refused
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
 
         // Proxy routes keep the permissive CORS that players rely on.
         let res = test::call_service(

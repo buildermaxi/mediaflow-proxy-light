@@ -18,9 +18,6 @@ pub enum AppError {
 
     #[error("Bad request: {0}")]
     BadRequest(String),
-
-    #[error("Serde JSON error: {0}")]
-    SerdeJsonError(#[from] serde_json::Error),
 }
 
 impl ResponseError for AppError {
@@ -33,9 +30,6 @@ impl ResponseError for AppError {
             }
             AppError::Upstream(msg) => HttpResponse::BadGateway().json(json!({ "error": msg })),
             AppError::BadRequest(msg) => HttpResponse::BadRequest().json(json!({ "error": msg })),
-            AppError::SerdeJsonError(err) => {
-                HttpResponse::InternalServerError().json(json!({ "error": err.to_string() }))
-            }
         }
     }
 }

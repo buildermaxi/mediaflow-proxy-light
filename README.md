@@ -1,50 +1,59 @@
-# MediaFlow Proxy Light ⚡️ — AIOStreams edition
+# MediaFlow Proxy Light ⚡️ — AIO Reborn edition
 
 A trimmed fork of [mediaflow-proxy-light](https://github.com/mhdzumair/mediaflow-proxy-light)
 (the Rust reimplementation of [MediaFlow Proxy](https://github.com/mhdzumair/mediaflow-proxy))
-that keeps only what [AIOStreams](https://github.com/Viren070/AIOStreams) uses when it is set to
-proxy Stremio streams through MediaFlow, plus a password-protected usage dashboard.
+that keeps only what [AIO Reborn](https://github.com/buildermaxi/aio-reborn) needs to send every
+Stremio stream through one machine — so the debrid service only ever sees its IP — plus a
+password-protected usage dashboard.
 
 ## What's in it
 
 | Method | Path | Used by |
 |---|---|---|
-| `GET` | `/proxy/ip` | AIOStreams — public IP the debrid links are bound to |
-| `POST` | `/generate_urls` | AIOStreams — batch URL generation (encrypted `/_token_…` or plain) |
-| `GET/HEAD` | `/proxy/stream`, `/proxy/stream/<filename>` | The Stremio player, via the URLs above (Range / seeking supported) |
+| `GET/HEAD` | `/_token_<token>/proxy/stream[/<filename>]` | The Stremio player, via URLs AIO Reborn builds (Range / seeking supported) |
+| `GET` | `/proxy/ip?api_password=…` | AIO Reborn — the public IPv4 debrid links are bound to |
 | `GET` | `/health` | Health checks |
 | `GET` | `/` | Usage dashboard (sign-in page without a session) |
 
-Auth: `?api_password=…`, an encrypted `?token=…`, or a `/_token_…/` path prefix.
-`/generate_urls` reads `api_password` from its JSON body.
+### Stream tokens
 
-Encrypted URLs are sealed with AES-256-GCM (key derived from the API password with
-HKDF-SHA256), so a token that wasn't minted by this server, or was modified, is
-refused. Each token only works on the endpoint it was generated for
-(`/proxy/stream`) and expires after `APP__AUTH__TOKEN_TTL` (48 hours by default), so
-resuming playback from a URL older than that fails until the player fetches a new one.
-Every rejected token gets the same `401 {"error":"Invalid or expired token"}`.
-These tokens are not interchangeable with the Python MediaFlow Proxy's AES-CBC
-tokens: URLs generated before upgrading stop working, and AIOStreams simply
-generates new ones.
+AIO Reborn mints the stream tokens itself, with the API password, and builds
+`<public URL>/_token_<token>/proxy/stream/<filename>` URLs: the server only opens them. There
+is no URL-generation route. A token is
+`base64url-no-pad(version ‖ nonce[12] ‖ AES-256-GCM(json))`, with the key derived from the API
+password by HKDF-SHA256 (see [`src/auth/encryption.rs`](src/auth/encryption.rs); the contract is
+pinned by [`tests/aio_reborn_contract.rs`](tests/aio_reborn_contract.rs), which opens a token
+minted by AIO Reborn's own code).
 
-All of this only applies to encrypted URLs. If AIOStreams has URL encryption turned
-off (`ENCRYPT_MEDIAFLOW_URLS=false`; it is on by default), its playback URLs carry
-`api_password` in clear, never expire and work on every route.
+- A token that wasn't sealed with the API password, or was modified, is refused.
+- It only works on the endpoint it was minted for (`/proxy/stream`).
+- It must expire, at most `APP__AUTH__TOKEN_TTL` from now (48 hours by default), whatever
+  lifetime the client asked for. AIO Reborn mints 24-hour links, so keep the limit at 24 hours
+  or more. Expiry needs a correct clock: the systemd unit waits for `time-sync.target`.
+- Everything a stream needs is in the token: any query string added to a token URL is dropped.
+- Every rejected token gets the same `401 {"error":"Invalid or expired token"}`.
 
-Everything else from upstream is gone: HLS and DASH/MPD proxying, ClearKey DRM, the
-video extractors, Telegram, Acestream, Xtream Codes, EPG proxy, `/proxy/forward`,
-transcoding, Redis, the iOS/Android FFI, `/metrics`, `/generate_url`, `/base64/*`, and the
-web tools (URL generator, speed test, playlist builder). Addons that call MediaFlow
-themselves with your URL (e.g. WebStreamr) need those — use upstream if you rely on them.
+The API password only opens `/proxy/ip` directly: streams can't be reached with
+`?api_password=…&d=…`, and there is no `?token=…` form.
+
+### Gone
+
+From upstream: HLS and DASH/MPD proxying, ClearKey DRM, the video extractors, Telegram,
+Acestream, Xtream Codes, EPG proxy, `/proxy/forward`, transcoding, Redis, the iOS/Android FFI,
+`/metrics`, `/generate_url`, `/base64/*`, and the web tools. Since the AIO Reborn edition, also:
+`/generate_urls`, unencrypted (`?d=…&h_*=…`) and base64 URLs, `?token=…`, token IP binding,
+upstream proxies (`PROXY_URL`, `ALL_PROXY`, transport routes: the debrid service must see this
+machine's IP), the flat `API_PASSWORD`/`HOST`/… variables of the Python proxy, the no-password
+mode, and the OpenSSL (`tls-native`) build. AIOStreams needs some of these: keep a pre-AIO Reborn
+release for it.
 
 ## Dashboard
 
 Open the server root (`/`) and sign in with the API password. The server answers with
 an `HttpOnly`, `SameSite=Strict` session cookie (an HMAC of the password, never the
 password itself) and checks it on the page and on every JSON feed
-(`/dashboard/stats`, `/dashboard/history`). Without an API password configured the
-dashboard stays locked. Changing the password signs every browser out.
+(`/dashboard/stats`, `/dashboard/history`). The server refuses to start without an API
+password (or with the example one). Changing the password signs every browser out.
 
 ## Run with Docker
 
@@ -56,8 +65,8 @@ docker run -d \
   ghcr.io/buildermaxi/mediaflow-proxy-light:latest
 ```
 
-In AIOStreams, set the proxy to **MediaFlow Proxy** with this server's URL and the same
-password.
+In AIO Reborn, set `MEDIAFLOW_URL` to this server's public URL and `MEDIAFLOW_API_PASSWORD` to
+the same password.
 
 ## Run natively (Raspberry Pi, any Linux)
 
@@ -88,9 +97,8 @@ OS must be the **64-bit** Raspberry Pi OS: check that `dpkg --print-architecture
 ## Configuration
 
 Loaded from environment variables → TOML file (`CONFIG_PATH`, see
-[`config-example.toml`](config-example.toml)) → built-in defaults.
-The flat `API_PASSWORD`, `HOST`, `PORT`, `WORKERS`, `PROXY_URL` and `ALL_PROXY` variables
-of the Python proxy are accepted too.
+[`config-example.toml`](config-example.toml)) → built-in defaults. Only the `APP__*` variables
+are read.
 
 ```bash
 # Server
@@ -98,23 +106,21 @@ APP__SERVER__HOST=0.0.0.0
 APP__SERVER__PORT=8888
 APP__SERVER__WORKERS=4
 
-# Auth (also unlocks the dashboard)
+# Auth — required: the server doesn't start without a password. Same value as
+# AIO Reborn's MEDIAFLOW_API_PASSWORD; it also unlocks the dashboard. Use 16
+# characters or more (install.sh generates one).
 APP__AUTH__API_PASSWORD=your-secure-password
-APP__AUTH__TOKEN_TTL=172800   # max lifetime of encrypted URLs, in seconds (0 = no default, no cap)
+APP__AUTH__TOKEN_TTL=172800   # longest lifetime a stream token may have left, in seconds (0 = no cap)
 
-# Upstream HTTP client
+# Upstream HTTP client (always direct: proxy environment variables are ignored)
 APP__PROXY__CONNECT_TIMEOUT=30
 APP__PROXY__FOLLOW_REDIRECTS=true
-APP__PROXY__PROXY_URL="socks5://user:pass@proxy:1080"   # optional upstream proxy
-APP__PROXY__ALL_PROXY=false
 APP__PROXY__REQUEST_TIMEOUT_FACTOR=8
 APP__PROXY__MAX_CONCURRENT_PER_HOST=10
 APP__PROXY__POOL_IDLE_TIMEOUT=90
 APP__PROXY__POOL_MAX_IDLE_PER_HOST=100
-APP__PROXY__TRANSPORT_ROUTES='{"all://*.cdn.example.com": {"proxy": true, "proxy_url": "socks5://proxy:1080"}}'
 
-# Public IP returned by /proxy/ip. When unset, each call looks it up through the
-# upstream proxy settings above, so behind WARP / SOCKS it's the proxy's exit IP.
+# Public IPv4 returned by /proxy/ip. When unset, each call looks it up (IPv4 only).
 APP__FORWARD__PUBLIC_IP=203.0.113.10
 
 # Logging
@@ -127,8 +133,7 @@ APP__LOG_LEVEL=info
 cargo build --release
 ```
 
-TLS uses rustls by default; `--no-default-features --features tls-native` switches to the
-system OpenSSL.
+TLS uses rustls, with Mozilla's CA list built in.
 
 ```bash
 cargo test

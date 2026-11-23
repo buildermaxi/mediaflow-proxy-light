@@ -20,7 +20,7 @@ use proxy::{handler, stream::StreamManager};
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     // Load config first so log_level from APP__LOG_LEVEL is available.
-    let config = Config::from_env().expect("Failed to load configuration");
+    let mut config = Config::from_env().expect("Failed to load configuration");
 
     // RUST_LOG takes precedence; fall back to config.log_level.
     let log_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| config.log_level.clone());
@@ -39,20 +39,20 @@ async fn main() -> std::io::Result<()> {
         .try_init()
         .expect("Failed to initialize logging");
 
-    // Loud warning when no API password is configured — silent no-auth mode is
-    // the most common footgun: any token-bearing request returns a cryptic 500
-    // rather than streaming, and operators chase ghosts.
-    if config.auth.api_password.is_empty() {
-        tracing::warn!(
-            "APP__AUTH__API_PASSWORD is not set — server is running in no-auth mode. \
-             Requests that carry an encrypted `?token=...` (or `/_token_/...` path) \
-             will be rejected with an explanatory 401, and callers must use direct \
-             `?d=<url>&h_*=...` mode. Set APP__AUTH__API_PASSWORD to enable \
-             token-based auth."
-        );
+    match config.validate() {
+        Ok(warnings) => {
+            for warning in warnings {
+                tracing::warn!("{warning}");
+            }
+        }
+        Err(reason) => {
+            tracing::error!("{reason}");
+            std::process::exit(1);
+        }
     }
 
-    let auth_middleware = AuthMiddleware::new(config.auth.api_password.clone());
+    let auth_middleware =
+        AuthMiddleware::new(config.auth.api_password.clone(), config.auth.token_ttl);
     let app_metrics = AppMetrics::new();
     metrics::history::spawn_sampler(app_metrics.clone());
     let stream_manager =
@@ -92,19 +92,14 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(config.clone()))
             .app_data(web::Data::new(metrics))
             .app_data(forward_config.clone())
-            // Batch URL generation (AIOStreams)
-            .service(
-                web::resource("/generate_urls")
-                    .wrap(Cors::permissive())
-                    .route(web::post().to(handler::generate_urls)),
-            )
             // Health check
             .service(web::scope("/health").route("", web::get().to(|| async { "OK" })))
             // Live usage dashboard; every route checks the session cookie
             // itself and stays out of CORS (see `dashboard::routes`).
             .configure(dashboard::routes)
-            // Generic /proxy scope (AIOStreams: stream + public IP); players
-            // and web clients need permissive CORS here.
+            // /proxy scope: streams (through `/_token_…/` URLs minted by AIO
+            // Reborn) and the public IP; players and web clients need
+            // permissive CORS here.
             .service(
                 web::scope("/proxy")
                     .wrap(Cors::permissive())

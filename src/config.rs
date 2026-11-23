@@ -1,30 +1,13 @@
-use config::{Map, Value};
-use regex::Regex;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use serde::Deserialize;
+use std::net::Ipv4Addr;
 use std::path::Path;
 use tracing::warn;
-use url::Url;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     pub workers: usize,
-}
-
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
-pub struct ProxyRouteConfig {
-    #[serde(default)]
-    pub proxy: bool,
-    #[serde(default)]
-    pub proxy_url: Option<String>,
-    #[serde(default = "default_verify_ssl")]
-    pub verify_ssl: bool,
-}
-
-fn default_verify_ssl() -> bool {
-    true
 }
 
 // ── ProxyConfig defaults ────────────────────────────────────────────────────
@@ -48,20 +31,9 @@ pub struct ProxyConfig {
     /// TCP handshake timeout (seconds) for a new upstream connection.
     pub connect_timeout: u64,
 
-    /// Whether reqwest should follow 3xx redirects.
+    /// Whether reqwest should follow 3xx redirects (addon playback links
+    /// usually redirect to the debrid download).
     pub follow_redirects: bool,
-
-    /// Optional default upstream HTTP/HTTPS/SOCKS proxy URL.
-    #[serde(default)]
-    pub proxy_url: Option<String>,
-
-    /// If true, route all upstream traffic through `proxy_url`.
-    #[serde(default)]
-    pub all_proxy: bool,
-
-    /// Per-pattern transport overrides (proxy, SSL verification).
-    #[serde(default)]
-    pub transport_routes: HashMap<String, ProxyRouteConfig>,
 
     // ── Tunables (all have sensible defaults) ─────────────────────────────
     /// Multiplier applied to `connect_timeout` to derive the full request
@@ -95,11 +67,13 @@ pub struct ProxyConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct AuthConfig {
+    /// Required: the server refuses to start without one. It authenticates
+    /// `/proxy/ip`, the dashboard, and is the key the stream tokens are
+    /// sealed with by the client.
     pub api_password: String,
-    /// Maximum lifetime, in seconds, of the encrypted URLs `/generate_urls`
-    /// mints. Also applied when the caller doesn't ask for an expiration.
-    /// `0` disables both the default and the cap: URLs then never expire
-    /// unless the caller asks, and keep whatever lifetime it asks for.
+    /// Longest lifetime, in seconds, a stream token may have left when it is
+    /// used: tokens without an expiry, or expiring further away, are
+    /// refused. `0` lifts the limit.
     ///
     /// Default: `172800` (48 hours).
     #[serde(default = "default_token_ttl")]
@@ -120,7 +94,7 @@ fn default_token_ttl() -> u64 {
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct ForwardConfig {
     /// MediaFlow's own public IP, returned by `GET /proxy/ip`. When unset,
-    /// each call looks it up through the upstream proxy settings.
+    /// each call looks it up (IPv4 only).
     #[serde(default)]
     pub public_ip: Option<String>,
 }
@@ -147,105 +121,6 @@ fn default_log_level() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Proxy routing
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-pub struct ProxyRoute {
-    pub pattern: Regex,
-    pub config: ProxyRouteConfig,
-}
-
-#[derive(Debug, Clone)]
-pub struct ProxyRouter {
-    default_proxy: Option<String>,
-    all_proxy: bool,
-    routes: Vec<ProxyRoute>,
-}
-
-impl ProxyRouter {
-    pub fn new(
-        default_proxy: Option<String>,
-        all_proxy: bool,
-        routes_config: HashMap<String, ProxyRouteConfig>,
-    ) -> Self {
-        let mut routes = Vec::new();
-
-        for (pattern, config) in routes_config {
-            let pattern = pattern
-                .replace(".", "\\.")
-                .replace("*", "[^/]*")
-                .replace("all://", "(http|https)://");
-
-            match Regex::new(&format!("^{}", pattern)) {
-                Ok(regex) => {
-                    routes.push(ProxyRoute {
-                        pattern: regex,
-                        config,
-                    });
-                }
-                Err(e) => {
-                    tracing::error!("Invalid route pattern '{}': {}", pattern, e);
-                }
-            }
-        }
-
-        // Sort routes by specificity (fewer wildcards = more specific = higher priority)
-        routes.sort_by(|a, b| {
-            let a_wildcards = a.pattern.as_str().matches("[^/]*").count();
-            let b_wildcards = b.pattern.as_str().matches("[^/]*").count();
-            b_wildcards.cmp(&a_wildcards)
-        });
-
-        Self {
-            default_proxy,
-            all_proxy,
-            routes,
-        }
-    }
-
-    pub fn from_config(config: &ProxyConfig) -> Self {
-        Self::new(
-            config.proxy_url.clone(),
-            config.all_proxy,
-            config.transport_routes.clone(),
-        )
-    }
-
-    pub fn get_proxy_config(&self, url: &str) -> Option<ProxyRouteConfig> {
-        match Url::parse(url) {
-            Ok(parsed_url) => {
-                let url_str = parsed_url.as_str();
-
-                for route in &self.routes {
-                    if route.pattern.is_match(url_str) {
-                        tracing::debug!("Matched route pattern: {}", route.pattern.as_str());
-                        return Some(route.config.clone());
-                    }
-                }
-
-                if self.all_proxy {
-                    return Some(ProxyRouteConfig {
-                        proxy: true,
-                        proxy_url: self.default_proxy.clone(),
-                        verify_ssl: true,
-                    });
-                }
-            }
-            Err(e) => {
-                tracing::error!("Failed to parse URL '{}': {}", url, e);
-            }
-        }
-
-        None
-    }
-
-    pub fn default_proxy(&self) -> &Option<String> {
-        &self.default_proxy
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Config loading
 // ---------------------------------------------------------------------------
 
@@ -259,10 +134,9 @@ impl Config {
             // Proxy
             .set_default("proxy.connect_timeout", 30)?
             .set_default("proxy.follow_redirects", true)?
-            .set_default("proxy.all_proxy", false)?
-            .set_default("proxy.transport_routes", HashMap::<String, Value>::new())?
-            // Auth
-            .set_default("auth.api_password", "changeme")?;
+            // Auth: no default password (see `main`, which refuses to start
+            // with an empty one).
+            .set_default("auth.api_password", "")?;
 
         if let Ok(config_path) = std::env::var("CONFIG_PATH") {
             let path = Path::new(&config_path);
@@ -273,63 +147,72 @@ impl Config {
             }
         }
 
-        // Python mediaflow-proxy compatibility: honour flat env vars when the
-        // structured APP__* equivalents are absent.  This lets users swap the
-        // Docker image without changing their environment.
-        let compat_pairs: &[(&str, &str)] = &[
-            ("API_PASSWORD", "auth.api_password"),
-            ("HOST", "server.host"),
-            ("PORT", "server.port"),
-            ("WORKERS", "server.workers"),
-            ("PROXY_URL", "proxy.proxy_url"),
-            ("ALL_PROXY", "proxy.all_proxy"),
-        ];
-        for (env_var, config_key) in compat_pairs {
-            if let Ok(val) = std::env::var(env_var) {
-                // Only apply when the APP__* equivalent is absent so the
-                // structured form always wins.
-                let app_key = format!("APP__{}", config_key.to_uppercase().replace('.', "__"));
-                if std::env::var(&app_key).is_err() {
-                    builder = builder.set_override(config_key, val)?;
-                }
-            }
-        }
-
         builder = builder.add_source(
             config::Environment::with_prefix("APP")
                 .separator("__")
                 .try_parsing(true),
         );
 
-        if let Ok(routes_json) = std::env::var("APP__PROXY__TRANSPORT_ROUTES") {
-            match serde_json::from_str::<HashMap<String, ProxyRouteConfig>>(&routes_json) {
-                Ok(routes) => {
-                    let routes_map = routes
-                        .into_iter()
-                        .map(|(k, v)| {
-                            let mut inner_map = Map::new();
-                            inner_map.insert("proxy".into(), Value::from(v.proxy));
-                            if let Some(url) = v.proxy_url {
-                                inner_map.insert("proxy_url".into(), Value::from(url));
-                            }
-                            inner_map.insert("verify_ssl".into(), Value::from(v.verify_ssl));
-                            (k, Value::from(inner_map))
-                        })
-                        .collect::<Map<String, Value>>();
+        let mut config: Config = builder.build()?.try_deserialize()?;
+        // `try_parsing` turns numeric-looking values into numbers ("00123456" →
+        // 123456, "1e5" → 100000): the password must stay the exact string the
+        // client derives its token key from.
+        if let Ok(raw) = std::env::var("APP__AUTH__API_PASSWORD") {
+            config.auth.api_password = raw;
+        }
+        Ok(config)
+    }
 
-                    builder =
-                        builder.set_override("proxy.transport_routes", Value::from(routes_map))?;
-                }
-                Err(e) => {
-                    return Err(config::ConfigError::Message(format!(
-                        "Failed to parse TRANSPORT_ROUTES: {}",
-                        e
-                    )));
-                }
-            }
+    /// Checks what the server must not run with, normalising along the way.
+    /// Returns the warnings to log, or the reason to refuse to start.
+    pub fn validate(&mut self) -> Result<Vec<String>, String> {
+        let mut warnings = Vec::new();
+
+        // No password, no server: it authenticates `/proxy/ip` and the
+        // dashboard, and it is the key stream tokens are sealed with.
+        let password = self.auth.api_password.as_str();
+        if password.is_empty() {
+            return Err(
+                "APP__AUTH__API_PASSWORD is not set. Set it (the same value as AIO \
+                 Reborn's MEDIAFLOW_API_PASSWORD) and restart."
+                    .to_string(),
+            );
+        }
+        if ["your-password", "changeme"].contains(&password) {
+            return Err(format!(
+                "APP__AUTH__API_PASSWORD is the example value \"{password}\": set a secret one."
+            ));
+        }
+        if password.chars().count() < 16 {
+            warnings.push(
+                "APP__AUTH__API_PASSWORD is shorter than 16 characters: a captured playback \
+                 link would allow guessing it offline."
+                    .to_string(),
+            );
         }
 
-        let config = builder.build()?;
-        config.try_deserialize()
+        // `/proxy/ip` only answers an IPv4 (debrid services are IPv4-only).
+        match self.forward.public_ip.as_deref().map(str::trim) {
+            None => {}
+            Some("") => self.forward.public_ip = None,
+            Some(ip) => match ip.parse::<Ipv4Addr>() {
+                Ok(ip) => self.forward.public_ip = Some(ip.to_string()),
+                Err(_) => {
+                    return Err(format!(
+                        "APP__FORWARD__PUBLIC_IP must be an IPv4 address, got \"{ip}\"."
+                    ))
+                }
+            },
+        }
+
+        for legacy in ["API_PASSWORD", "PROXY_URL", "ALL_PROXY"] {
+            if std::env::var_os(legacy).is_some() {
+                warnings.push(format!(
+                    "{legacy} is no longer read: only the APP__* variables are (and upstream \
+                     proxies are gone)."
+                ));
+            }
+        }
+        Ok(warnings)
     }
 }

@@ -1,19 +1,21 @@
-//! Encrypted, authenticated proxy tokens (`/_token_…` and `?token=…`).
+//! Encrypted, authenticated proxy tokens (the `/_token_…/` path prefix).
 //!
 //! A token is `base64url-no-pad(version[1] || nonce[12] || AES-256-GCM(json))`,
 //! where `json` is the serialised [`ProxyData`]. The AES key is derived from
-//! the API password with HKDF-SHA256.
+//! the API password with HKDF-SHA256 (no salt, `info` = [`KEY_INFO`]), and the
+//! version-tagged [`TOKEN_AAD`] is authenticated alongside.
+//!
+//! Tokens are minted by the client that holds the API password (AIO Reborn
+//! does it in its Cloudflare Worker); the server only opens them. This format
+//! is therefore a contract: changing it means bumping [`TOKEN_VERSION`] and
+//! updating the client in step.
 //!
 //! GCM authenticates the ciphertext: a token that was not minted with the
-//! server's key, or that was modified in any way, fails before its contents
+//! API password, or that was modified in any way, fails before its contents
 //! are looked at. Every rejection — malformed, forged, tampered, expired,
-//! bound to another IP or another endpoint — returns the same
-//! [`INVALID_TOKEN`] error, so a client can't tell the failure modes apart.
-//! The precise reason is only logged at `debug` level.
-//!
-//! Tokens are only ever minted by this server (`POST /generate_urls`), so the
-//! format doesn't need to match the Python mediaflow-proxy's AES-CBC tokens,
-//! which are no longer accepted.
+//! living longer than the server allows, or bound to another endpoint —
+//! returns the same [`INVALID_TOKEN`] error, so a client can't tell the
+//! failure modes apart. The precise reason is only logged at `debug` level.
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -21,12 +23,10 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hkdf::Hkdf;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::AppError;
-use crate::utils::client_ip::parse_ip;
 
 /// The only error message a client ever sees for a rejected token.
 pub const INVALID_TOKEN: &str = "Invalid or expired token";
@@ -41,26 +41,29 @@ const KEY_INFO: &[u8] = b"mediaflow-proxy-light/token-key/v1";
 /// version byte (see [`token_aad`]).
 const TOKEN_AAD: &[u8] = b"mediaflow-proxy-light/token";
 
+/// What a token carries. Unknown fields are ignored, so tokens minted by an
+/// older client with extra fields still open.
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct ProxyData {
+    /// Upstream URL the stream is read from.
     pub destination: String,
-    pub query_params: Option<Value>,
-    pub request_headers: Option<Value>,
-    pub response_headers: Option<Value>,
     /// Unix timestamp (seconds) after which the token is rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exp: Option<u64>,
-    /// Client IP the token is bound to.
-    pub ip: Option<String>,
     /// Endpoint the token was minted for (e.g. `/proxy/stream`). A token is
     /// only accepted on that path or below it (`/proxy/stream/<filename>`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
 }
 
-/// Seals and opens proxy tokens with a key derived from the API password.
+/// Opens (and, for tests and tools, seals) proxy tokens with a key derived
+/// from the API password.
 #[derive(Clone)]
 pub struct EncryptionHandler {
     cipher: Aes256Gcm,
+    /// Longest remaining lifetime, in seconds, a token may claim; `0` means
+    /// no limit. With a limit, a token must carry an expiry.
+    max_lifetime: u64,
 }
 
 impl EncryptionHandler {
@@ -71,7 +74,18 @@ impl EncryptionHandler {
             .map_err(|_| AppError::Internal("Failed to derive the token key".to_string()))?;
         let cipher = Aes256Gcm::new_from_slice(&key)
             .map_err(|_| AppError::Internal("Failed to initialise the token cipher".to_string()))?;
-        Ok(Self { cipher })
+        Ok(Self {
+            cipher,
+            max_lifetime: 0,
+        })
+    }
+
+    /// Refuse tokens without an expiry, or whose expiry is more than
+    /// `seconds` away (`0` lifts the limit). Bounds how long a leaked URL
+    /// stays usable, whatever lifetime the client asked for.
+    pub fn with_max_lifetime(mut self, seconds: u64) -> Self {
+        self.max_lifetime = seconds;
+        self
     }
 
     pub fn encrypt(&self, data: &ProxyData) -> Result<String, AppError> {
@@ -99,22 +113,17 @@ impl EncryptionHandler {
         Ok(URL_SAFE_NO_PAD.encode(token))
     }
 
-    /// Opens `token` and checks its expiry and IP binding, without checking
+    /// Opens `token` and checks its expiry and lifetime, without checking
     /// which endpoint it is used on. Requests go through [`Self::authorize`].
-    pub fn decrypt(&self, token: &str, client_ip: Option<&str>) -> Result<ProxyData, AppError> {
-        self.open(token, client_ip).map_err(reject)
+    pub fn decrypt(&self, token: &str) -> Result<ProxyData, AppError> {
+        self.open(token).map_err(reject)
     }
 
-    /// Opens `token` for a request to `path` (the path after any `/_token_…`
+    /// Opens `token` for a request to `path` (the path after the `/_token_…`
     /// prefix has been removed). On top of [`Self::decrypt`], the token must
     /// have been minted for the endpoint `path` is on.
-    pub fn authorize(
-        &self,
-        token: &str,
-        client_ip: Option<&str>,
-        path: &str,
-    ) -> Result<ProxyData, AppError> {
-        self.open(token, client_ip)
+    pub fn authorize(&self, token: &str, path: &str) -> Result<ProxyData, AppError> {
+        self.open(token)
             .and_then(|data| {
                 if endpoint_allows(data.endpoint.as_deref(), path) {
                     Ok(data)
@@ -125,7 +134,7 @@ impl EncryptionHandler {
             .map_err(reject)
     }
 
-    fn open(&self, token: &str, client_ip: Option<&str>) -> Result<ProxyData, &'static str> {
+    fn open(&self, token: &str) -> Result<ProxyData, &'static str> {
         let raw = URL_SAFE_NO_PAD
             .decode(token)
             .map_err(|_| "token is not base64url")?;
@@ -155,15 +164,15 @@ impl EncryptionHandler {
         if data.destination.is_empty() {
             return Err("token has no destination");
         }
-        if data.exp.is_some_and(|exp| exp < unix_now()) {
+        let now = unix_now();
+        if data.exp.is_some_and(|exp| exp < now) {
             return Err("token has expired");
         }
-        if let Some(bound_ip) = &data.ip {
-            // Compared as canonical addresses; fail closed when either side
-            // is missing or unparsable.
-            let bound = parse_ip(bound_ip);
-            if bound.is_none() || bound != client_ip.and_then(parse_ip) {
-                return Err("token is bound to another client IP");
+        if self.max_lifetime > 0 {
+            match data.exp {
+                None => return Err(NO_EXPIRY),
+                Some(exp) if exp > now.saturating_add(self.max_lifetime) => return Err(TOO_LONG),
+                Some(_) => {}
             }
         }
         Ok(data)
@@ -204,9 +213,20 @@ fn token_aad(version: u8) -> Vec<u8> {
 }
 
 fn reject(reason: &'static str) -> AppError {
-    tracing::debug!("rejected proxy token: {reason}");
+    if reason == NO_EXPIRY || reason == TOO_LONG {
+        // A configuration mismatch, not an attack: every link would be refused.
+        tracing::warn!(
+            "rejected proxy token: {reason} — check APP__AUTH__TOKEN_TTL against the \
+             lifetime of the links AIO Reborn mints (24 h)"
+        );
+    } else {
+        tracing::debug!("rejected proxy token: {reason}");
+    }
     AppError::Auth(INVALID_TOKEN.to_string())
 }
+
+const NO_EXPIRY: &str = "token has no expiry";
+const TOO_LONG: &str = "token lives longer than the server allows";
 
 /// Current Unix time in seconds (0 if the clock is before 1970).
 pub fn unix_now() -> u64 {
@@ -245,7 +265,7 @@ mod tests {
     #[test]
     fn round_trip() {
         let token = handler().encrypt(&stream_data()).unwrap();
-        let data = handler().decrypt(&token, None).unwrap();
+        let data = handler().decrypt(&token).unwrap();
         assert_eq!(data.destination, DEST);
         assert_eq!(data.endpoint.as_deref(), Some("/proxy/stream"));
     }
@@ -265,10 +285,7 @@ mod tests {
             .unwrap()
             .encrypt(&stream_data())
             .unwrap();
-        assert_eq!(
-            error_message(handler().decrypt(&token, None)),
-            INVALID_TOKEN
-        );
+        assert_eq!(error_message(handler().decrypt(&token)), INVALID_TOKEN);
     }
 
     /// Flipping any single bit anywhere in the token must be detected.
@@ -284,7 +301,7 @@ mod tests {
                 tampered[i] ^= 1 << bit;
                 let token = URL_SAFE_NO_PAD.encode(&tampered);
                 assert_eq!(
-                    error_message(h.decrypt(&token, None)),
+                    error_message(h.decrypt(&token)),
                     INVALID_TOKEN,
                     "byte {i} bit {bit}"
                 );
@@ -305,55 +322,40 @@ mod tests {
         let wrong_version = URL_SAFE_NO_PAD.encode(&wrong_version);
 
         let failures: Vec<(&str, Result<ProxyData, AppError>)> = vec![
-            ("not base64", h.decrypt("not base64!", None)),
-            ("empty", h.decrypt("", None)),
+            ("not base64", h.decrypt("not base64!")),
+            ("empty", h.decrypt("")),
             (
                 "too short",
-                h.decrypt(&URL_SAFE_NO_PAD.encode([TOKEN_VERSION; 8]), None),
+                h.decrypt(&URL_SAFE_NO_PAD.encode([TOKEN_VERSION; 8])),
             ),
-            ("truncated", h.decrypt(&truncated, None)),
-            ("wrong version", h.decrypt(&wrong_version, None)),
+            ("truncated", h.decrypt(&truncated)),
+            ("wrong version", h.decrypt(&wrong_version)),
             (
                 "expired",
-                h.decrypt(
-                    &seal(ProxyData {
-                        exp: Some(1),
-                        ..stream_data()
-                    }),
-                    None,
-                ),
-            ),
-            (
-                "ip mismatch",
-                h.decrypt(
-                    &seal(ProxyData {
-                        ip: Some("1.2.3.4".into()),
-                        ..stream_data()
-                    }),
-                    Some("9.9.9.9"),
-                ),
-            ),
-            (
-                "ip unknown",
-                h.decrypt(
-                    &seal(ProxyData {
-                        ip: Some("1.2.3.4".into()),
-                        ..stream_data()
-                    }),
-                    None,
-                ),
+                h.decrypt(&seal(ProxyData {
+                    exp: Some(1),
+                    ..stream_data()
+                })),
             ),
             (
                 "no destination",
-                h.decrypt(
-                    &seal(ProxyData {
-                        destination: String::new(),
-                        ..stream_data()
-                    }),
-                    None,
-                ),
+                h.decrypt(&seal(ProxyData {
+                    destination: String::new(),
+                    ..stream_data()
+                })),
             ),
-            ("wrong endpoint", h.authorize(&valid, None, "/proxy/ip")),
+            (
+                "no expiry under a lifetime limit",
+                h.clone().with_max_lifetime(3600).decrypt(&valid),
+            ),
+            (
+                "lives too long",
+                h.clone().with_max_lifetime(3600).decrypt(&seal(ProxyData {
+                    exp: Some(unix_now() + 7200),
+                    ..stream_data()
+                })),
+            ),
+            ("wrong endpoint", h.authorize(&valid, "/proxy/ip")),
         ];
         for (case, result) in failures {
             assert_eq!(error_message(result), INVALID_TOKEN, "{case}");
@@ -366,43 +368,35 @@ mod tests {
     fn legacy_cbc_token_is_rejected() {
         let legacy = "AAECAwQFBgcICQoLDA0OD1NDNLU6BmO_093POOmfhHoL29QQVC_7Zf3ZkxMIV0AmCCVw7DPCWWcA59PdeoN7PQ";
         let h = EncryptionHandler::new(b"test_secret").unwrap();
-        assert_eq!(error_message(h.decrypt(legacy, None)), INVALID_TOKEN);
+        assert_eq!(error_message(h.decrypt(legacy)), INVALID_TOKEN);
     }
 
     #[test]
-    fn future_expiry_and_matching_ip_are_accepted() {
-        let h = handler();
+    fn future_expiry_within_the_lifetime_limit_is_accepted() {
+        let h = handler().with_max_lifetime(3600);
         let token = h
             .encrypt(&ProxyData {
-                exp: Some(unix_now() + 3600),
-                ip: Some("1.2.3.4".into()),
+                exp: Some(unix_now() + 1800),
                 ..stream_data()
             })
             .unwrap();
-        assert!(h.decrypt(&token, Some("1.2.3.4")).is_ok());
+        assert!(h.decrypt(&token).is_ok());
+        // Without a limit, a token may also carry no expiry at all.
+        assert!(handler()
+            .decrypt(&handler().encrypt(&stream_data()).unwrap())
+            .is_ok());
     }
 
+    /// Fields a previous version of the payload carried (headers, client IP…)
+    /// are ignored rather than failing the token.
     #[test]
-    fn ip_binding_compares_canonical_addresses() {
-        let h = handler();
-        let bound_to = |ip: &str| {
-            h.encrypt(&ProxyData {
-                ip: Some(ip.into()),
-                ..stream_data()
-            })
-            .unwrap()
-        };
-        let token = bound_to("1.2.3.4");
-        for same in ["1.2.3.4", "1.2.3.4:5678", "::ffff:1.2.3.4"] {
-            assert!(h.decrypt(&token, Some(same)).is_ok(), "{same}");
-        }
-        assert!(h.decrypt(&token, Some("1.2.3.5")).is_err());
-        let v6 = bound_to("2001:db8:0::1");
-        assert!(h.decrypt(&v6, Some("[2001:db8::1]:443")).is_ok());
-        // A bound IP that doesn't parse can never match.
-        assert!(h
-            .decrypt(&bound_to("not-an-ip"), Some("not-an-ip"))
-            .is_err());
+    fn unknown_payload_fields_are_ignored() {
+        let data: ProxyData = serde_json::from_str(
+            r#"{"destination":"https://a/b","ip":"1.2.3.4","request_headers":{"x":"y"},"endpoint":"/proxy/stream"}"#,
+        )
+        .unwrap();
+        assert_eq!(data.destination, "https://a/b");
+        assert_eq!(data.endpoint.as_deref(), Some("/proxy/stream"));
     }
 
     #[test]
@@ -410,7 +404,7 @@ mod tests {
         let h = handler();
         let token = h.encrypt(&stream_data()).unwrap();
         for ok in ["/proxy/stream", "/proxy/stream/", "/proxy/stream/movie.mkv"] {
-            assert!(h.authorize(&token, None, ok).is_ok(), "{ok}");
+            assert!(h.authorize(&token, ok).is_ok(), "{ok}");
         }
         for denied in [
             "/proxy/ip",
@@ -426,7 +420,7 @@ mod tests {
             "/proxy/stream/%2E./ip",
             "/proxy/stream/./movie.mkv",
         ] {
-            assert!(h.authorize(&token, None, denied).is_err(), "{denied}");
+            assert!(h.authorize(&token, denied).is_err(), "{denied}");
         }
     }
 
@@ -439,8 +433,8 @@ mod tests {
                 ..stream_data()
             })
             .unwrap();
-        assert!(h.decrypt(&token, None).is_ok());
-        assert!(h.authorize(&token, None, "/proxy/stream").is_err());
+        assert!(h.decrypt(&token).is_ok());
+        assert!(h.authorize(&token, "/proxy/stream").is_err());
     }
 
     #[test]

@@ -48,10 +48,15 @@ jobs:
         # unit) is much slower to build, and this reuses clippy's dep builds.
         run: cargo test -- --test-threads=1
 
-      - name: Install cargo-machete
+      - name: Install cargo-machete and cargo-audit
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-machete
+          tool: cargo-machete,cargo-audit
 
       - name: Audit unused dependencies
         run: cargo machete
+
+      - name: Audit dependencies for known vulnerabilities (RustSec)
+        # Fails the build when an advisory (or an unsound/yanked warning) hits a
+        # locked crate: run `cargo update` and check again.
+        run: cargo audit --deny warnings
